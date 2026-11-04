@@ -5,7 +5,7 @@
 ## 資料夾內容
 
 ```
-mid_project/
+folder/
 ├── main/
 │   └── test.py         # 主程式
 ├── legacy/
