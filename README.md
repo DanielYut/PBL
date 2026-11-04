@@ -2,7 +2,23 @@
 
 用相機拍攝工件，自動辨識工件邊緣或接縫，產生焊道／塗膠路徑，再交給台達六軸手臂執行。目標是取代人工逐點示教：換工件、換擺放位置時，不必重新教點。
 
-> 本資料夾是新專題的主程式位置，目前仍在開發中。舊的紅藍筆蓋夾取專案說明請見根目錄的 [README.md](../README.md)，舊程式在 [legacy/mid.py](../legacy/mid.py)。
+> 目前仍在開發中，主程式放在 [main/](main/)。舊的紅藍筆蓋夾取專案說明請見 [legacy/README.md](legacy/README.md)。
+
+## 資料夾內容
+
+```
+mid_project/
+├── main/
+│   └── test.py         # 新專題主程式（開發中）
+├── legacy/
+│   ├── mid.py          # 舊專題：紅藍筆蓋分類夾取
+│   └── README.md       # 舊專題說明
+├── drv_modbus/
+│   ├── send.py         # 手臂控制：Go_Position、gripper_ON、gripper_OFF
+│   └── request.py      # 讀取手臂狀態（send.py 會用到）
+├── requirements.txt
+└── README.md
+```
 
 ## 專題目標
 
@@ -28,14 +44,22 @@
 | 3 手臂控制 | 3-1 IKM 計算與撞機檢查 | 用逆向運動學檢查奇異點與碰撞 |
 | | 3-2 實機操作 | 透過 Modbus TCP 控制手臂執行路徑 |
 
-手臂控制沿用 [drv_modbus/](../drv_modbus/)：
+手臂控制沿用 [drv_modbus/](drv_modbus/)：
 
 - `send.Go_Position(c, x, y, z, rx, ry, rz, speed, mov)`：移動到指定點位，`mov` 可選 `send.MovP`（點對點）或 `send.MovL`（直線，適合走焊道）。
 - `request.Get_TCP_Pose(c)`：讀取手臂目前的 TCP 座標。
 
 ## 環境與執行
 
-安裝方式與根目錄 README 相同（`pip install -r requirements.txt`，pymodbus 必須是 3.6.x）。
+需要 Python 3.8 ~ 3.12（pyrealsense2 不一定支援更新的版本）、Intel RealSense 相機（USB 3.0），以及和電腦在同一個網段的台達 DRV 手臂。
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+pip install -r requirements.txt
+```
+
+> pymodbus 必須是 3.6.x。新版（3.7 以後）拿掉了 `drv_modbus` 用到的 `pymodbus.payload`，也改了函式參數寫法，裝新版會直接出錯。
 
 在 `mid_project/` 根目錄下執行：
 
