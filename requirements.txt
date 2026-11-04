@@ -1,0 +1,6 @@
+# Python 3.8 - 3.12
+# pymodbus must be 3.6.x: drv_modbus uses pymodbus.payload and positional slave args, removed in 3.7+
+pymodbus==3.6.9
+pyrealsense2
+opencv-python
+numpy
