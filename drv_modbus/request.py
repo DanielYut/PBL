@@ -1,8 +1,17 @@
 from pymodbus.payload import BinaryPayloadDecoder
 from pymodbus.constants import Endian
 
+
+def ensure_connected(robot_client):
+    """控制器會把閒置太久的連線關掉，斷線時自動重連"""
+    if not robot_client.connected:
+        print("🔌 手臂連線中斷，重新連線...")
+        robot_client.connect()
+
+
 def Get_TCP_Pose(robot_client):
-    request = robot_client.read_holding_registers(0x00F0, 12, 2)  
+    ensure_connected(robot_client)
+    request = robot_client.read_holding_registers(0x00F0, 12, 2)
 
     if request.isError():
         print("request error!")
@@ -25,7 +34,8 @@ def Get_TCP_Pose(robot_client):
     return x , y , z , rx, ry, rz
 
 def Get_Pose_Flag(robot_client):
-    request = robot_client.read_holding_registers(0x031F, 1, 2)  
+    ensure_connected(robot_client)
+    request =robot_client.read_holding_registers(0x031F, 1, 2)  
     if request.isError():
         print("request error!")
         return
