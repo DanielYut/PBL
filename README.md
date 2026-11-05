@@ -2,14 +2,25 @@
 
 用相機拍攝工件，自動辨識工件邊緣或接縫，產生焊道／塗膠路徑，再交給台達六軸手臂執行。目標是取代人工逐點示教：換工件、換擺放位置時，不必重新教點。
 
-> 目前仍在開發中，主程式放在 [main/](main/)。舊的紅藍筆蓋夾取專案說明請見 [legacy/README.md](legacy/README.md)。
+> 目前仍在開發中，程式放在 [main/](main/)。已完成「相機內參校正」與「手眼校正（eye-in-hand）」，使用方式請見[手眼校正流程](#手眼校正流程eye-in-hand)。舊的紅藍筆蓋夾取專案說明請見 [legacy/README.md](legacy/README.md)。
 
 ## 資料夾內容
 
 ```
 mid_project/
 ├── main/
-│   └── test.py         # 新專題主程式（開發中）
+│   ├── config.py               # 共用設定（相機、校正目標、手臂 IP、暫存器），到實驗室先改這裡
+│   ├── 01_intrinsic_calib.py   # 步驟 1：相機內參校正
+│   ├── 03_handeye_solve.py     # 步驟 3：計算夾爪到相機的轉換 T_gripper_cam
+│   ├── 04_verify.py            # 步驟 4：驗證手眼校正（即時顯示標記在基座座標的位置）
+│   ├── 05_pen_touch.py         # 步驟 5：筆尖校正與筆尖對點驗證
+│   ├── aruco_target.py         # ArUco 標記偵測與位姿估計
+│   ├── rs_camera.py            # RealSense 影像串流（彩色／IR 自動切換）
+│   ├── robot_modbus.py         # 用 Modbus TCP 讀取手臂位姿
+│   └── data/
+│       ├── intrinsics.npz          # 自行校正的內參
+│       ├── factory_intrinsics.npz  # RealSense 出廠內參
+│       └── T_gripper_cam.npz       # 手眼校正結果
 ├── legacy/
 │   ├── mid.py          # 舊專題：紅藍筆蓋分類夾取
 │   └── README.md       # 舊專題說明
@@ -61,13 +72,32 @@ pip install -r requirements.txt
 
 > pymodbus 必須是 3.6.x。新版（3.7 以後）拿掉了 `drv_modbus` 用到的 `pymodbus.payload`，也改了函式參數寫法，裝新版會直接出錯。
 
-在 `mid_project/` 根目錄下執行：
+手眼校正的程式要先進到 `main/` 資料夾再執行（程式裡的 `data/` 路徑是相對於 `main/`）：
 
 ```bash
-python -m main.test
+cd main
+python 01_intrinsic_calib.py
 ```
 
-> 不要用 `python main/test.py`，否則會找不到 `drv_modbus` 模組。
+## 手眼校正流程（eye-in-hand）
+
+相機裝在手臂夾爪上，校正目標是桌上的四個 ArUco 標記（也可以在 `config.py` 改成棋盤格）。開始前先檢查 [main/config.py](main/config.py)：
+
+- `ROBOT_IP`、`ROBOT_UNIT_ID`：手臂控制器的 IP 和 Unit ID。
+- `ARUCO_SIZE_MM`：用尺量黑色正方形外框的邊長，不含外面的白邊。
+- `COLOR_WIDTH`／`COLOR_HEIGHT`：內參校正和手眼校正必須用同一個解析度。
+- `CAMERA_STREAM`：彩色和 IR 不能混用，換串流就要重做內參和手眼校正。
+
+| 步驟 | 指令 | 說明 |
+|---|---|---|
+| 1 內參校正 | `python 01_intrinsic_calib.py` | 拍至少 15 張棋盤格照片後按 `c` 計算。沒有棋盤格時可加 `--factory`，直接用 RealSense 出廠內參 |
+| 3 手眼校正 | `python 03_handeye_solve.py` | 讀取 `data/handeye/` 裡的照片和 `poses.csv`（每張照片拍攝時的手臂位姿），算出夾爪到相機的 offset，存成 `data/T_gripper_cam.npz`。至少要 6 組樣本 |
+| 4 驗證 | `python 04_verify.py` | 用教導器移動手臂，標記在基座座標的位置應該幾乎不變（散佈 < 2~3 mm 才算準） |
+| 5 筆尖對點 | `python 05_pen_touch.py --tool`，再執行 `python 05_pen_touch.py` | 先做筆尖校正，再讓筆尖逐步下降去碰標記中心，確認實際誤差 |
+
+> 步驟 4 按 `v`、步驟 5 按 `m`/`n`/`j`/`t` 時手臂會移動（速度 10%）。操作時手要放在教導器的緊急停止鈕旁邊，第一次對點先停在 `j`（離標記 2 mm）確認。
+>
+> 第 2 步「收集手眼校正資料」目前沒有程式，`data/handeye/` 裡的照片和 `poses.csv` 要先準備好。
 
 ## 團隊分工
 
