@@ -2,63 +2,22 @@
 
 用相機拍攝工件，自動辨識工件邊緣或接縫，產生焊道／塗膠路徑，再交給台達六軸手臂執行。目標是取代人工逐點示教：換工件、換擺放位置時，不必重新教點。
 
-> 目前仍在開發中，程式放在 [main/](main/)。已完成「相機內參校正」與「手眼校正（eye-in-hand）」，使用方式請見[手眼校正流程](#手眼校正流程eye-in-hand)。舊的紅藍筆蓋夾取專案說明請見 [legacy/README.md](legacy/README.md)。
+> 目前用「夾麥克筆沿物體邊緣畫線」模擬焊槍走焊道，程式是 [main/marker_draw.py](main/marker_draw.py)。
 
 ## 資料夾內容
 
 ```
 mid_project/
 ├── main/
-│   ├── config.py               # 共用設定（相機、校正目標、手臂 IP、暫存器），到實驗室先改這裡
-│   ├── 01_intrinsic_calib.py   # 步驟 1：相機內參校正
-│   ├── 03_handeye_solve.py     # 步驟 3：計算夾爪到相機的轉換 T_gripper_cam
-│   ├── 04_verify.py            # 步驟 4：驗證手眼校正（即時顯示標記在基座座標的位置）
-│   ├── 05_pen_touch.py         # 步驟 5：筆尖校正與筆尖對點驗證
-│   ├── aruco_target.py         # ArUco 標記偵測與位姿估計
-│   ├── rs_camera.py            # RealSense 影像串流（彩色／IR 自動切換）
-│   ├── robot_modbus.py         # 用 Modbus TCP 讀取手臂位姿
-│   └── data/
-│       ├── intrinsics.npz          # 自行校正的內參
-│       ├── factory_intrinsics.npz  # RealSense 出廠內參
-│       └── T_gripper_cam.npz       # 手眼校正結果
-├── legacy/
-│   ├── mid.py          # 舊專題：紅藍筆蓋分類夾取
-│   └── README.md       # 舊專題說明
-├── drv_modbus/
-│   ├── send.py         # 手臂控制：Go_Position、gripper_ON、gripper_OFF
-│   └── request.py      # 讀取手臂狀態（send.py 會用到）
+│   ├── marker_draw.py   # 主程式：夾麥克筆，沿偵測到的物體邊緣畫線（單一檔案，不依賴其他檔案）
+│   ├── send.py          # 手臂控制函式庫：Go_Position、gripper_ON/OFF 等
+│   └── request.py       # 讀取手臂狀態（send.py 會用到）
+├── data/
+│   ├── marker_tool_offset.json  # 筆尖偏移與紙面高度（ArUco 定位後自動存）
+│   └── background.png           # 底圖（程式裡按 b 拍）
 ├── requirements.txt
 └── README.md
 ```
-
-## 專題目標
-
-- 利用相機影像量測產生路徑，提高精確度、降低誤差。
-- 工件放在不同位置或旋轉角度時，都能產生對應的正確路徑。
-
-**預期效益**：減少示教時間、讓產品品質一致，適合少量多樣的生產。
-
-## 系統流程
-
-```
-相機擷取影像 → 邊緣／接縫辨識 → 像素座標轉手臂座標（手眼校正）
-           → 路徑點產生 → IKM 計算與撞機檢查 → 手臂沿路徑作業
-```
-
-| 模組 | 項目 | 說明 |
-|---|---|---|
-| 1 感知模組 | 1-1 相機架設與內參校正 | 固定相機高度，校正鏡頭內參與畸變 |
-| | 1-2 手眼校正 | 建立影像座標與手臂座標的轉換 |
-| | 1-3 邊緣辨識 | 找出工件輪廓或接縫 |
-| 2 路徑規劃模組 | 2-1 路徑點產生 | 沿輪廓取樣出手臂可執行的路徑點 |
-| | 2-2 焊接品質 | 評估路徑與作業結果（評估標準待定義） |
-| 3 手臂控制 | 3-1 IKM 計算與撞機檢查 | 用逆向運動學檢查奇異點與碰撞 |
-| | 3-2 實機操作 | 透過 Modbus TCP 控制手臂執行路徑 |
-
-手臂控制沿用 [drv_modbus/](drv_modbus/)：
-
-- `send.Go_Position(c, x, y, z, rx, ry, rz, speed, mov)`：移動到指定點位，`mov` 可選 `send.MovP`（點對點）或 `send.MovL`（直線，適合走焊道）。
-- `request.Get_TCP_Pose(c)`：讀取手臂目前的 TCP 座標。
 
 ## 環境與執行
 
@@ -70,34 +29,78 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-> pymodbus 必須是 3.6.x。新版（3.7 以後）拿掉了 `drv_modbus` 用到的 `pymodbus.payload`，也改了函式參數寫法，裝新版會直接出錯。
+> pymodbus 必須是 3.6.x。新版（3.7 以後）拿掉了 `send.py`／`request.py` 用到的 `pymodbus.payload`，也改了函式參數寫法，裝新版會直接出錯。
 
-手眼校正的程式要先進到 `main/` 資料夾再執行（程式裡的 `data/` 路徑是相對於 `main/`）：
+在 `mid_project` 資料夾執行：
 
 ```bash
-cd main
-python 01_intrinsic_calib.py
+python main/marker_draw.py
 ```
 
-## 手眼校正流程（eye-in-hand）
+## 麥克筆畫邊緣（marker_draw.py）
 
-相機裝在手臂夾爪上，校正目標是桌上的四個 ArUco 標記（也可以在 `config.py` 改成棋盤格）。開始前先檢查 [main/config.py](main/config.py)：
+第一次執行前，先檢查檔案開頭「1. 設定」區塊：
 
-- `ROBOT_IP`、`ROBOT_UNIT_ID`：手臂控制器的 IP 和 Unit ID。
-- `ARUCO_SIZE_MM`：用尺量黑色正方形外框的邊長，不含外面的白邊。
-- `COLOR_WIDTH`／`COLOR_HEIGHT`：內參校正和手眼校正必須用同一個解析度。
-- `CAMERA_STREAM`：彩色和 IR 不能混用，換串流就要重做內參和手眼校正。
+- `ARM_IP`、`UNIT_ID`：手臂控制器的 IP 和 Unit ID。
+- `X_HOME` … `RZ_HOME`：拍照位置。改了就要重新做 ArUco 定位。
+- `OBJ_HEIGHT_MM`：畫在物體頂面填物體高度，畫在紙上（物體周圍）填 0。
+- `Z_PAPER`、`Z_MIN`：筆尖碰到紙面的 Z，以及安全下限。
 
-| 步驟 | 指令 | 說明 |
+流程：
+
+| 階段 | 說明 |
+|---|---|
+| GRIP | 夾爪打開 → 把麥克筆放進夾爪（筆尖朝下）→ 按 Enter 夾緊 |
+| ARUCO | 筆尖依序到 4 個角的 ArUco 標記上方，對準後按 Enter。程式算出筆尖偏移並存到 `data/marker_tool_offset.json`，下次自動載入 |
+| HOME | 回拍照位置 |
+| DETECT | 預覽畫面偵測白紙上的物體，藍線是邊緣路徑（畫面轉 180° 跟實際方向一致） |
+| CONFIRM | 終端機印出路徑點，按 `y` 開始畫，其他鍵取消 |
+| DRAW | 到第 1 點上方 → 下筆 → 沿邊緣直線移動一圈 → 抬筆 → 回 HOME |
+
+DETECT 畫面的按鍵：
+
+| 按鍵 | 功能 |
+|---|---|
+| `n` | 換下一個物體 |
+| `s` | 鎖定路徑，進入 CONFIRM |
+| `a` | 重新做 ArUco 定位 |
+| `b` | 拍底圖（白紙清空時拍）。灰色／銀色物體需要底圖才抓得到 |
+| 滑鼠點畫面 + `t` | 在點的位置點一個點，用來檢查偏移量 |
+| `q` | 結束，會問要不要鬆開夾爪 |
+
+> 畫線時手臂會移動到紙面高度。操作時手要放在教導器的緊急停止鈕旁邊，第一次先確認 `Z_PAPER` 和 `Z_MIN` 正確。
+
+## 手臂控制函式庫
+
+[main/send.py](main/send.py) 和 [main/request.py](main/request.py) 用 Modbus TCP 控制手臂，要在 `main/` 裡 import（`send.py` 用 `import request`）：
+
+- `send.Go_Position(c, x, y, z, rx, ry, rz, speed, mov)`：移動到指定點位，`mov` 可選 `send.MovP`（點對點）或 `send.MovL`（直線，適合走焊道）。
+- `send.gripper_ON(c)`／`send.gripper_OFF(c)`：夾爪夾緊／打開。
+- `request.Get_TCP_Pose(c)`：讀取手臂目前的 TCP 座標。
+
+## 專題目標
+
+- 利用相機影像量測產生路徑，提高精確度、降低誤差。
+- 工件放在不同位置或旋轉角度時，都能產生對應的正確路徑。
+
+**預期效益**：減少示教時間、讓產品品質一致，適合少量多樣的生產。
+
+## 系統流程
+
+```
+相機擷取影像 → 邊緣／接縫辨識 → 像素座標轉手臂座標
+           → 路徑點產生 → IKM 計算與撞機檢查 → 手臂沿路徑作業
+```
+
+| 模組 | 項目 | 說明 |
 |---|---|---|
-| 1 內參校正 | `python 01_intrinsic_calib.py` | 拍至少 15 張棋盤格照片後按 `c` 計算。沒有棋盤格時可加 `--factory`，直接用 RealSense 出廠內參 |
-| 3 手眼校正 | `python 03_handeye_solve.py` | 讀取 `data/handeye/` 裡的照片和 `poses.csv`（每張照片拍攝時的手臂位姿），算出夾爪到相機的 offset，存成 `data/T_gripper_cam.npz`。至少要 6 組樣本 |
-| 4 驗證 | `python 04_verify.py` | 用教導器移動手臂，標記在基座座標的位置應該幾乎不變（散佈 < 2~3 mm 才算準） |
-| 5 筆尖對點 | `python 05_pen_touch.py --tool`，再執行 `python 05_pen_touch.py` | 先做筆尖校正，再讓筆尖逐步下降去碰標記中心，確認實際誤差 |
-
-> 步驟 4 按 `v`、步驟 5 按 `m`/`n`/`j`/`t` 時手臂會移動（速度 10%）。操作時手要放在教導器的緊急停止鈕旁邊，第一次對點先停在 `j`（離標記 2 mm）確認。
->
-> 第 2 步「收集手眼校正資料」目前沒有程式，`data/handeye/` 裡的照片和 `poses.csv` 要先準備好。
+| 1 感知模組 | 1-1 相機架設與內參校正 | 固定相機高度，校正鏡頭內參與畸變 |
+| | 1-2 座標轉換 | 建立影像座標與手臂座標的轉換（目前用 4 個 ArUco 標記定位） |
+| | 1-3 邊緣辨識 | 找出工件輪廓或接縫 |
+| 2 路徑規劃模組 | 2-1 路徑點產生 | 沿輪廓取樣出手臂可執行的路徑點 |
+| | 2-2 焊接品質 | 評估路徑與作業結果（評估標準待定義） |
+| 3 手臂控制 | 3-1 IKM 計算與撞機檢查 | 用逆向運動學檢查奇異點與碰撞 |
+| | 3-2 實機操作 | 透過 Modbus TCP 控制手臂執行路徑 |
 
 ## 團隊分工
 
