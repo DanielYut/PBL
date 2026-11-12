@@ -2,18 +2,22 @@
 
 用相機拍攝工件，自動辨識工件邊緣或接縫，產生焊道／塗膠路徑，再交給台達六軸手臂執行。目標是取代人工逐點示教：換工件、換擺放位置時，不必重新教點。
 
-> 目前用「夾麥克筆沿物體邊緣畫線」模擬焊槍走焊道，程式是 [main/marker_draw.py](main/marker_draw.py)。
+> 目前用「夾麥克筆沿物體邊緣畫線」模擬焊槍／膠槍。兩支程式：
+> - [main/marker_draw.py](main/marker_draw.py)：輪廓簡化成特徵點（方塊只剩 4 個角），角跟角之間拉直線。
+> - [main/glue_edge.py](main/glue_edge.py)：沿偵測到的邊緣連續走（塗膠），曲線、圓角都照實際形狀走。
 
 ## 資料夾內容
 
 ```
 mid_project/
 ├── main/
-│   ├── marker_draw.py   # 主程式：夾麥克筆，沿偵測到的物體邊緣畫線（單一檔案，不依賴其他檔案）
+│   ├── marker_draw.py   # 夾麥克筆，沿物體邊緣的特徵點畫線（單一檔案，不依賴其他檔案）
+│   ├── glue_edge.py     # 夾麥克筆模擬塗膠，沿物體邊緣連續走（單一檔案，不依賴其他檔案）
 │   ├── send.py          # 手臂控制函式庫：Go_Position、gripper_ON/OFF 等
 │   └── request.py       # 讀取手臂狀態（send.py 會用到）
 ├── data/
-│   ├── marker_tool_offset.json  # 筆尖偏移與紙面高度（ArUco 定位後自動存）
+│   ├── aruco_xy_calib.json      # ArUco 4 點 XY 校正 + 筆尖偏移（兩支程式共用，校正後自動存）
+│   ├── marker_tool_offset.json  # 舊 Marker 的校正紀錄（程式已不再讀取）
 │   └── background.png           # 底圖（程式裡按 b 拍）
 ├── requirements.txt
 └── README.md
@@ -34,7 +38,8 @@ pip install -r requirements.txt
 在 `mid_project` 資料夾執行：
 
 ```bash
-python main/marker_draw.py
+python main/marker_draw.py    # 特徵點畫線
+python main/glue_edge.py      # 沿邊緣連續塗膠
 ```
 
 ## 麥克筆畫邊緣（marker_draw.py）
@@ -44,14 +49,14 @@ python main/marker_draw.py
 - `ARM_IP`、`UNIT_ID`：手臂控制器的 IP 和 Unit ID。
 - `X_HOME` … `RZ_HOME`：拍照位置。改了就要重新做 ArUco 定位。
 - `OBJ_HEIGHT_MM`：畫在物體頂面填物體高度，畫在紙上（物體周圍）填 0。
-- `Z_PAPER`、`Z_MIN`：筆尖碰到紙面的 Z，以及安全下限。
+- `Z_PAPER`、`Z_MIN`：筆尖碰到紙面的 Z，以及安全下限。高度只用程式裡的值，校正不會改 Z。
 
 流程：
 
 | 階段 | 說明 |
 |---|---|
 | GRIP | 夾爪打開 → 把麥克筆放進夾爪（筆尖朝下）→ 按 Enter 夾緊 |
-| ARUCO | 筆尖依序到 4 個角的 ArUco 標記上方，對準後按 Enter。程式算出筆尖偏移並存到 `data/marker_tool_offset.json`，下次自動載入 |
+| ARUCO | 程式詢問要做哪一種：<br>**Enter** 檢查筆尖偏移：用示教器讓筆尖對準 4 個角的 ArUco 中心，算出平均偏移<br>**c** 完整重新校正（換了 Marker／紙板／相機時用）：重新偵測 4 個 Marker，用示教器讓筆尖對準每個中心，重建像素→手臂的 XY 對應<br>**x** 跳過<br>結果都存到 `data/aruco_xy_calib.json`，下次自動載入 |
 | HOME | 回拍照位置 |
 | DETECT | 預覽畫面偵測白紙上的物體，藍線是邊緣路徑（畫面轉 180° 跟實際方向一致） |
 | CONFIRM | 終端機印出路徑點，按 `y` 開始畫，其他鍵取消 |
@@ -63,12 +68,37 @@ DETECT 畫面的按鍵：
 |---|---|
 | `n` | 換下一個物體 |
 | `s` | 鎖定路徑，進入 CONFIRM |
-| `a` | 重新做 ArUco 定位 |
+| `a` | 檢查筆尖偏移 |
+| `c` | 完整重新校正（換了 Marker／紙板／相機） |
 | `b` | 拍底圖（白紙清空時拍）。灰色／銀色物體需要底圖才抓得到 |
 | 滑鼠點畫面 + `t` | 在點的位置點一個點，用來檢查偏移量 |
 | `q` | 結束，會問要不要鬆開夾爪 |
 
 > 畫線時手臂會移動到紙面高度。操作時手要放在教導器的緊急停止鈕旁邊，第一次先確認 `Z_PAPER` 和 `Z_MIN` 正確。
+
+完整重新校正時，如果某個 Marker 偵測不到，程式會讓你在畫面上點它的中心。程式會自動試好幾種 ArUco 字典。
+
+## 沿邊緣塗膠（glue_edge.py）
+
+從 `marker_draw.py` 複製出來，校正、按鍵、流程都一樣，差在路徑和移動方式：
+
+- **路徑**：使用邊緣上每一個像素 → 平滑 → 每隔 `GLUE_STEP_MM` 取一點。直的地方合成一段，彎的地方點照樣密。
+- **頭尾接合**：走完一圈回到起點後，再多走 `GLUE_OVERLAP_MM`，讓膠線接起來。
+- **減少停頓**：一到位馬上送下一段。快到終點時會提前送下一段；控制器若不接受，程式偵測到後會自動關閉這個功能。塗完會印出統計。
+
+可調參數（檔案開頭「塗膠路徑」區塊）：
+
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `GLUE_STEP_MM` | 3.0 | 每段多長，越小越貼邊、停頓越多 |
+| `SMOOTH_PX` | 7 | 邊緣平滑程度（像素，奇數） |
+| `GLUE_MERGE_TOL_MM` | 0.3 | 直的地方合併的容許誤差，0 = 不合併 |
+| `GLUE_OVERLAP_MM` | 5.0 | 頭尾重疊長度，0 = 不重疊 |
+| `GLUE_EARLY_MM` | 1.0 | 離終點多少 mm 就提前送下一段，0 = 關閉。越大越順、轉角切得越多 |
+| `GLUE_PAUSE_S` | 0.0 | 每段之間額外停頓秒數 |
+| `SPEED_GLUE` | 同 `SPEED_DRAW` | 塗膠速度（%） |
+
+> 每段之間仍可能有很短的停頓：控制器在移動中可能忽略新指令。要完全連續，需要用示教器的「連續」功能（要查台達 DRAStudio 的 Modbus Address 對照表，尚未實作）。
 
 ## 手臂控制函式庫
 

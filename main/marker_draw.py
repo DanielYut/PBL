@@ -3,8 +3,11 @@
 
 流程：
   [GRIP]    夾爪打開 → 你把麥克筆放進夾爪 (筆尖朝下) → 按 Enter → 夾緊
-  [ARUCO]   筆尖依序到 4 個角的 Marker 上方，用 i/k/j/l 微調對準後按 Enter，
-            自動算出筆尖偏移並存檔 (data/marker_tool_offset.json，下次自動載入)
+  [ARUCO]   Enter：筆尖依序到 4 個角的 Marker，對準後按 Enter，
+                   自動算出筆尖偏移並存檔 (data/aruco_xy_calib.json，下次自動載入)
+            c    ：換了 Marker / 紙板 / 相機 → 完整重新校正：重新偵測 4 個 Marker，
+                   示教器讓筆尖對準每個中心，重建像素→手臂 XY 對應 (data/aruco_xy_calib.json)
+            ※ 只校正 XY。Z 一律用程式裡設定的 Z_PAPER / Z_DRAW
   [HOME]    回拍照位置
   [DETECT]  預覽畫面：偵測白紙上的物體，算出邊緣路徑 (藍線)。畫面已轉 180° 跟實際方向一致
               a: 重新做 ArUco 定位
@@ -66,7 +69,7 @@ SIMPLIFY_PX = 2.0       # 輪廓簡化程度 (越大點越少；方塊只剩 4 �
 MIN_SEG_MM = 2.0        # 相鄰路徑點至少隔多少 mm
 
 # --- 工具偏移 (筆尖相對夾爪中心) ---
-# ArUco 定位時微調對準並按 Enter 記錄，程式會自動算出偏移存到 data/marker_tool_offset.json，
+# ArUco 定位時微調對準並按 Enter 記錄，程式會自動算出偏移存到 data/aruco_xy_calib.json，
 # 下次啟動自動載入 (會蓋掉下面兩個值)
 TOOL_OFFSET_X = 0.0
 TOOL_OFFSET_Y = 0.0
@@ -75,8 +78,8 @@ TOOL_OFFSET_Y = 0.0
 DISPLAY_ROTATE_180 = True   # 相機畫面跟實際看到的上下左右相反 → 轉 180° 顯示 (只影響顯示，不影響計算)
 
 # --- ArUco 定位 (畫之前先讓筆尖到 4 個角的 Marker 中心，確認位置準不準) ---
-Z_PAPER = 465.776       # 筆尖碰到「紙面」時的 Z (2026-11-05 示教器實測)
-                        # ※ data/marker_tool_offset.json 有 z_paper 時會用那個值
+Z_PAPER = 436.157       # 筆尖碰到「紙面」時的 Z (2026-11-05 示教器實測)
+                        # ※ 高度只用這裡 (或 Z_DRAW) 的值，校正不會改 Z
 ARUCO_HOVER_MM = 10.0   # 停在 Marker 上方幾 mm
 ARUCO_DICT = cv2.aruco.DICT_5X5_50
 ARUCO_MATCH_PX = 40     # 偵測到的 Marker 跟記錄位置差多少 px 內算同一個
@@ -90,7 +93,6 @@ JOG_TIMEOUT = 8.0       # 微調時超過幾秒沒到位 → 視為到不了 (�
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 BG_PATH = os.path.join(DATA_DIR, "background.png")
-OFFSET_PATH = os.path.join(DATA_DIR, "marker_tool_offset.json")
 
 # ==========================================
 # 2. 手臂控制 (Modbus TCP)
@@ -196,13 +198,15 @@ class Arm:
 # 3. 像素 → 手臂座標 (校正)
 # ==========================================
 # 4 個 ArUco Marker：Home 拍照時的像素中心 ↔ 「麥克筆尖」碰 Marker 中心時的 TCP X, Y
-# (2026-11-05 示教器實測，紙面 Z=492.77。已包含筆尖偏移，所以 TOOL_OFFSET 保持 0)
+# (2026-11-05 舊 Marker 示教器實測。已包含筆尖偏移，所以 TOOL_OFFSET 保持 0)
 # 順序 = 相機原始畫面 左上, 右上, 右下, 左下 (顯示轉 180° 後是 右下, 左下, 左上, 右上)
 # 手臂在 Home 時：相機畫面往右 = 手臂 -Y，往下 = 手臂 -X
+# ※ data/aruco_xy_calib.json 存在時 (做過「完整重新校正」c) 會用那裡的值蓋掉下面兩組
 PTS_PIXEL = np.float32([[134.61, 91.71], [529.51, 84.99], [538.75, 420.06], [130.86, 420.98]])
 PTS_ARM = np.float32([[653.210, 75.842], [647.689, -209.430], [403.074, -211.327], [402.948, 75.895]])
 # 舊值 (舊專案留下的，不準)：[[607.466, 62.870], [607.466, -221.951], [374.376, -221.951], [374.376, 58.249]]
 H_MATRIX, _ = cv2.findHomography(PTS_PIXEL, PTS_ARM)
+CALIB_PATH = os.path.join(DATA_DIR, "aruco_xy_calib.json")   # 新 Marker 的 XY 校正 + 筆尖偏移
 
 # 高度視差：物體頂面比紙面高、離相機近，看起來會往外擴。以相機正下方為中心縮回。
 CAM_CENTER_PX = (318.7, 246.8)   # 相機光軸在畫面上的位置 (RealSense 640x480 內參)
@@ -219,8 +223,38 @@ def pixel_to_arm(u, v, height_mm=0.0):
     return p[0] / p[2] + TOOL_OFFSET_X, p[1] / p[2] + TOOL_OFFSET_Y
 
 
-MM_PER_PX = float(np.mean([np.linalg.norm(PTS_ARM[i] - PTS_ARM[(i + 1) % 4]) /
-                           np.linalg.norm(PTS_PIXEL[i] - PTS_PIXEL[(i + 1) % 4]) for i in range(4)]))
+def side_scales(pts_pixel, pts_arm):
+    """4 個邊各自的 mm/px"""
+    return [float(np.linalg.norm(pts_arm[i] - pts_arm[(i + 1) % 4]) /
+                  np.linalg.norm(pts_pixel[i] - pts_pixel[(i + 1) % 4])) for i in range(4)]
+
+
+MM_PER_PX = float(np.mean(side_scales(PTS_PIXEL, PTS_ARM)))
+
+
+def set_calibration(pts_pixel, pts_arm):
+    global PTS_PIXEL, PTS_ARM, H_MATRIX, MM_PER_PX
+    PTS_PIXEL, PTS_ARM = np.float32(pts_pixel), np.float32(pts_arm)
+    H_MATRIX, _ = cv2.findHomography(PTS_PIXEL, PTS_ARM)
+    MM_PER_PX = float(np.mean(side_scales(PTS_PIXEL, PTS_ARM)))
+
+
+def load_calibration():
+    """讀 data/aruco_xy_calib.json：4 點 XY 對應 + 筆尖偏移 (Z 不從檔案讀，用程式裡的 Z_PAPER / Z_DRAW)"""
+    global ARUCO_DICT
+    if not os.path.exists(CALIB_PATH):
+        print("📐 Marker 對應用程式裡寫死的值 (還沒做過完整重新校正)")
+        return
+    global TOOL_OFFSET_X, TOOL_OFFSET_Y
+    with open(CALIB_PATH, encoding="utf-8") as fp:
+        d = json.load(fp)
+    if d.get("pts_pixel") and d.get("pts_arm"):
+        set_calibration(d["pts_pixel"], d["pts_arm"])
+        print(f"📐 已載入 Marker XY 對應 {CALIB_PATH} ({d['saved_at']}, {d.get('aruco_dict', '')})")
+    if d.get("aruco_dict"):
+        ARUCO_DICT = getattr(cv2.aruco, d["aruco_dict"])
+    TOOL_OFFSET_X, TOOL_OFFSET_Y = d.get("tool_offset_x", 0.0), d.get("tool_offset_y", 0.0)
+    print(f"📐 筆尖偏移 X={TOOL_OFFSET_X:+.2f}, Y={TOOL_OFFSET_Y:+.2f} mm")
 
 
 # ==========================================
@@ -374,9 +408,9 @@ def draw_path(arm, pts):
     arm.move(x0, y0, Z_TRAVEL)
 
 
-def detect_aruco(pipeline, n_frames=10):
+def detect_aruco(pipeline, n_frames=10, dict_id=None):
     """連拍 n 張平均，回傳 {id: (u, v)} Marker 中心"""
-    d = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
+    d = cv2.aruco.getPredefinedDictionary(ARUCO_DICT if dict_id is None else dict_id)
     acc = {}
     for _ in range(n_frames):
         gray = cv2.cvtColor(grab(pipeline), cv2.COLOR_BGR2GRAY)
@@ -388,6 +422,125 @@ def detect_aruco(pipeline, n_frames=10):
             for i, c in zip(ids.flatten(), corners):
                 acc.setdefault(int(i), []).append(c.reshape(4, 2).mean(axis=0))
     return {i: tuple(np.mean(v, axis=0)) for i, v in acc.items()}
+
+
+ARUCO_DICT_CANDIDATES = ["DICT_4X4_50", "DICT_5X5_50", "DICT_6X6_50", "DICT_7X7_50",
+                         "DICT_ARUCO_ORIGINAL", "DICT_APRILTAG_36h11"]
+
+
+MAIN_MOUSE = None   # main() 的滑鼠 callback，借用視窗後要換回去
+
+
+def click_marker(pipeline, win, pts):
+    """偵測不到的那個 Marker：讓使用者在畫面上點它的中心。回傳 (u, v) 相機像素或 None"""
+    frame = grab(pipeline)
+    clicked = {"pt": None}
+
+    def cb(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicked["pt"] = flip_pt((x, y), frame.shape)
+    cv2.setMouseCallback(win, cb)
+    print("  👉 在影像視窗點「沒偵測到的那個 Marker」正中心，Enter 確定，Esc 取消")
+    try:
+        while True:
+            out = frame.copy()
+            for _, u, v in pts:
+                cv2.circle(out, (int(u), int(v)), 10, (0, 255, 0), 2)
+            if clicked["pt"]:
+                cv2.drawMarker(out, clicked["pt"], (0, 0, 255), cv2.MARKER_CROSS, 24, 2)
+            out = to_display(out)
+            put_text(out, "Click the MISSING marker center, Enter: OK, Esc: cancel", (10, 25), (0, 0, 255), 0.55)
+            cv2.imshow(win, out)
+            key = cv2.waitKey(30) & 0xFF
+            if key in (13, 10) and clicked["pt"]:
+                return float(clicked["pt"][0]), float(clicked["pt"][1])
+            if key == 27:
+                return None
+    finally:
+        if MAIN_MOUSE:
+            cv2.setMouseCallback(win, MAIN_MOUSE)   # 換回預覽畫面的點選
+
+
+def detect_four(pipeline, win):
+    """
+    完整重新校正用：直接抓畫面上的 4 個 Marker (不跟舊位置比對)。
+    各種字典都試，合起來剛好 4 個就用；只抓到 3 個 → 讓你點第 4 個
+    回傳 (字典名稱, [(id, u, v)] 依相機原始畫面 左上, 右上, 右下, 左下)；失敗回傳 None
+    """
+    global ARUCO_DICT
+    found, best = {}, (0, None)
+    for n in ARUCO_DICT_CANDIDATES:
+        f = detect_aruco(pipeline, 10, getattr(cv2.aruco, n))
+        print(f"  {n}: 偵測到 {len(f)} 個 {sorted(f)}")
+        for i, uv in f.items():
+            # 同一個 Marker 被不同字典抓到 → 位置一樣，只留一個
+            if all(math.hypot(uv[0] - q[0], uv[1] - q[1]) > 20 for q in found.values()):
+                found[f"{n}:{i}"] = uv
+        if len(f) > best[0]:
+            best = (len(f), n)
+    dict_name = best[1]
+    if len(found) == 3:
+        print("⚠️ 只偵測到 3 個 Marker")
+        pts = [(k, u, v) for k, (u, v) in found.items()]
+        uv = click_marker(pipeline, win, pts)
+        if uv is None:
+            return None
+        found["點選"] = uv
+    if len(found) != 4:
+        print(f"⚠️ 偵測到 {len(found)} 個 Marker，要剛好 4 個。確認 4 個都在畫面內、沒被擋住/反光，"
+              "畫面裡沒有多的 Marker")
+        return None
+    ARUCO_DICT = getattr(cv2.aruco, dict_name)
+    print(f"  → 用 {dict_name}")
+    pts = [(i, u, v) for i, (u, v) in found.items()]
+    cu, cv_ = np.mean([p[1] for p in pts]), np.mean([p[2] for p in pts])
+    order = {(True, True): 0, (True, False): 1, (False, False): 2, (False, True): 3}  # (上?, 左?)
+    pts.sort(key=lambda p: order[(p[2] < cv_, p[1] < cu)])
+    if len({order[(p[2] < cv_, p[1] < cu)] for p in pts}) != 4:
+        print("⚠️ 4 個 Marker 沒有分在 4 個角，請擺成矩形四角")
+        return None
+    return dict_name, pts
+
+
+def write_calib_json(**fields):
+    """更新 CALIB_PATH 裡的欄位 (其他欄位保留)"""
+    d = {}
+    if os.path.exists(CALIB_PATH):
+        with open(CALIB_PATH, encoding="utf-8") as fp:
+            d = json.load(fp)
+    d.update(fields, saved_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CALIB_PATH, "w", encoding="utf-8") as fp:
+        json.dump(d, fp, ensure_ascii=False, indent=2)
+
+
+def save_calibration(taught, dict_name):
+    """
+    taught = [(u, v, X, Y)]：Marker 像素中心 + 筆尖對準 Marker 中心時的 TCP X, Y (只做 XY，不管 Z)
+    重建 像素 → 手臂 的對應。教的就是「筆尖」位置，所以筆尖偏移歸 0
+    """
+    global TOOL_OFFSET_X, TOOL_OFFSET_Y
+    cu, cv_ = np.mean([t[0] for t in taught]), np.mean([t[1] for t in taught])
+    order = {(True, True): 0, (True, False): 1, (False, False): 2, (False, True): 3}  # 原始畫面 (上?, 左?)
+    taught = sorted(taught, key=lambda t: order[(t[1] < cv_, t[0] < cu)])
+    px = np.float32([[t[0], t[1]] for t in taught])
+    am = np.float32([[t[2], t[3]] for t in taught])
+    sc = side_scales(px, am)
+    print("\n========== 完整重新校正結果 (XY) ==========")
+    for (u, v, x, y) in taught:
+        print(f"  像素 ({u:6.1f}, {v:6.1f}) → X={x:.3f}, Y={y:.3f}")
+    print(f"  4 邊的 mm/px：{', '.join(f'{s:.3f}' for s in sc)}  (舊的平均 {MM_PER_PX:.3f})")
+    if (max(sc) - min(sc)) / np.mean(sc) > 0.15:   # 相機有點斜，舊校正本身就差 ~8%
+        print("  ⚠️ 4 邊比例差超過 15%，可能有點對歪或順序教錯了，建議重做")
+    if input("  要套用並存檔嗎？(y/n) > ").strip().lower() != "y":
+        print("  沒有存")
+        return False
+    set_calibration(px, am)
+    TOOL_OFFSET_X = TOOL_OFFSET_Y = 0.0
+    write_calib_json(pts_pixel=px.tolist(), pts_arm=am.tolist(), aruco_dict=dict_name,
+                     home=[X_HOME, Y_HOME, Z_HOME], tool_offset_x=0.0, tool_offset_y=0.0, corrections=[])
+    print(f"  💾 已存到 {CALIB_PATH}，筆尖偏移歸 0")
+    return True
 
 
 JOG_KEYS = {ord('i'): (0, -1), ord('k'): (0, 1), ord('j'): (-1, 0), ord('l'): (1, 0)}  # 畫面上/下/左/右
@@ -405,26 +558,9 @@ def screen_dir_to_arm(u, v, sdx, sdy):
     return (x1 - x0) / n, (y1 - y0) / n
 
 
-def load_tool_offset():
-    global TOOL_OFFSET_X, TOOL_OFFSET_Y, Z_PAPER
-    if os.path.exists(OFFSET_PATH):
-        with open(OFFSET_PATH, encoding="utf-8") as fp:
-            d = json.load(fp)
-        TOOL_OFFSET_X, TOOL_OFFSET_Y = d["tool_offset_x"], d["tool_offset_y"]
-        print(f"📐 已載入筆尖偏移 X={TOOL_OFFSET_X:+.2f}, Y={TOOL_OFFSET_Y:+.2f} mm ({d['saved_at']})")
-        if d.get("z_paper") is not None:
-            Z_PAPER = d["z_paper"]
-            print(f"📐 已載入紙面高度 Z_PAPER={Z_PAPER:.3f}")
-    else:
-        print(f"📐 筆尖偏移 X={TOOL_OFFSET_X:+.2f}, Y={TOOL_OFFSET_Y:+.2f} mm (還沒用 ArUco 校正過)")
-
-
-def save_tool_offset(corrections, z_touch=None):
-    """
-    corrections = [(名稱, dX, dY)]：實際對準位置 - 程式算的位置
-    z_touch = 筆尖碰到 Marker 時的 Z list (示教器教點時才有) → 平均當紙面高度
-    """
-    global TOOL_OFFSET_X, TOOL_OFFSET_Y, Z_PAPER
+def save_tool_offset(corrections):
+    """corrections = [(名稱, dX, dY)]：實際對準位置 - 程式算的位置 (只做 XY)"""
+    global TOOL_OFFSET_X, TOOL_OFFSET_Y
     d = np.array([[c[1], c[2]] for c in corrections])
     mean = d.mean(axis=0)
     spread = np.hypot(*(d - mean).T).max() if len(d) > 1 else 0.0
@@ -436,29 +572,20 @@ def save_tool_offset(corrections, z_touch=None):
         print("  ⚠️ 各點偏的不一樣 (> 3 mm)，不只是筆夾歪，校正本身可能有問題，先不要存")
     new_x, new_y = TOOL_OFFSET_X + mean[0], TOOL_OFFSET_Y + mean[1]
     print(f"  新的筆尖偏移：X={new_x:+.2f}, Y={new_y:+.2f} (原本 {TOOL_OFFSET_X:+.2f}, {TOOL_OFFSET_Y:+.2f})")
-    z_paper = None
-    if z_touch:
-        z_paper = float(np.mean(z_touch))
-        print(f"  紙面高度 (筆尖碰 Marker 的 Z 平均)：{z_paper:.3f}，各點差 {np.ptp(z_touch):.2f} mm"
-              + ("  ⚠️ 差超過 2 mm，可能有點沒碰到或紙不平" if np.ptp(z_touch) > 2 else ""))
     if input("  要套用並存檔嗎？(y/n) > ").strip().lower() != "y":
         print("  沒有存")
         return
     TOOL_OFFSET_X, TOOL_OFFSET_Y = float(new_x), float(new_y)
-    if z_paper is not None:
-        Z_PAPER = z_paper
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(OFFSET_PATH, "w", encoding="utf-8") as fp:
-        json.dump({"tool_offset_x": TOOL_OFFSET_X, "tool_offset_y": TOOL_OFFSET_Y, "z_paper": z_paper,
-                   "corrections": [{"name": n, "dx": dx, "dy": dy} for n, dx, dy in corrections],
-                   "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}, fp, ensure_ascii=False, indent=2)
-    print(f"  💾 已套用並存到 {OFFSET_PATH}")
+    write_calib_json(tool_offset_x=TOOL_OFFSET_X, tool_offset_y=TOOL_OFFSET_Y,
+                     corrections=[{"name": n, "dx": float(dx), "dy": float(dy)} for n, dx, dy in corrections])
+    print(f"  💾 已套用並存到 {CALIB_PATH}")
 
 
-def teach_with_pendant(arm, pipeline, win, targets):
+def teach_with_pendant(arm, pipeline, win, targets, recalib=None):
     """
     用示教器教點：程式不動手臂，只告訴你順序、在你按 Enter 時讀手臂座標。
     順序依「轉正後的畫面」(= 實際看到的方向)：左上 → 右上 → 右下 → 左下
+    recalib = 字典名稱 → 完整重新校正 (4 點都要教，重建像素 → 手臂對應)；None → 只算筆尖偏移
     """
     snapshot = grab(pipeline)                 # 手臂在 Home 拍的畫面，教點時當參考
     shape = snapshot.shape
@@ -480,10 +607,12 @@ def teach_with_pendant(arm, pipeline, win, targets):
     for k, (_, name, src, u, v, x, y) in enumerate(items, 1):
         side = f"X {'大' if x > cx else '小'}、Y {'大' if y > cy else '小'}"
         print(f"  第 {k} 點：畫面{name} 的 Marker [{src}]  ({side})  預估 X={x:.2f}, Y={y:.2f}")
-    print("用示教器把「筆尖」移到 Marker 正中心、輕輕碰到紙，回到影像視窗按 Enter 記錄")
+    if recalib:
+        print("※ 完整重新校正：預估座標是用舊的對應算的，可能差很多，以畫面上 Marker 的實際位置為準。4 點都要教")
+    print("用示教器把「筆尖」移到 Marker 正中心 (只看 XY，高度隨意)，回到影像視窗按 Enter 記錄")
     print("  Enter: 記錄   空白: 跳過   Esc: 結束")
 
-    corrections, z_touch = [], []
+    corrections, taught = [], []
     stopped = False
     last_poll, pose = 0.0, None
     for k, (_, name, src, u, v, x, y) in enumerate(items, 1):
@@ -518,7 +647,7 @@ def teach_with_pendant(arm, pipeline, win, targets):
                 p = arm.pose()
                 dx, dy = p[0] - x, p[1] - y
                 corrections.append((name, dx, dy))
-                z_touch.append(p[2])
+                taught.append((u, v, p[0], p[1]))
                 print(f"   ✅ 記錄 X={p[0]:.3f}, Y={p[1]:.3f}, Z={p[2]:.3f}  (跟預估差 ΔX {dx:+.2f}, ΔY {dy:+.2f})")
                 break
             if key == 32:
@@ -530,12 +659,38 @@ def teach_with_pendant(arm, pipeline, win, targets):
         if stopped:
             break
 
-    if corrections:
-        save_tool_offset(corrections, z_touch)
+    if recalib:
+        if len(taught) == 4:
+            save_calibration(taught, recalib)
+        else:
+            print(f"⚠️ 完整重新校正要 4 點都教 (只教了 {len(taught)} 點)，沒有存")
+    elif corrections:
+        save_tool_offset(corrections)
     input("\n教點結束。用示教器把筆抬高、控制器切回遠端/自動模式後按 Enter，手臂會回 Home > ")
     arm.home()
     time.sleep(1.0)
     return not stopped
+
+
+def recalibrate(arm, pipeline, win):
+    """
+    換了 Marker / 移了紙板 / 動了相機：在 Home 重新抓 4 個 Marker 的像素位置，
+    用示教器讓筆尖碰每個 Marker 中心，重建 像素 → 手臂 的對應
+    """
+    arm.home()
+    time.sleep(1.0)
+    print("\n========== 完整重新校正：偵測 Marker ==========")
+    r = detect_four(pipeline, win)
+    if r is None:
+        return False
+    dict_name, pts = r
+    names = ["左上", "右上", "右下", "左下"]
+    targets = []
+    for name, (mid, u, v) in zip(names, pts):
+        x, y = pixel_to_arm(u, v)
+        targets.append((name, f"ID {mid}", u, v, x, y, None))
+        print(f"  {name} [ID {mid}] 像素 ({u:.1f}, {v:.1f})")
+    return teach_with_pendant(arm, pipeline, win, targets, recalib=dict_name)
 
 
 def locate_aruco(arm, pipeline, win):
@@ -718,7 +873,7 @@ def render(frame, cnts, sel, path_px, click, status):
         sx, sy = flip_pt(path_px[0], frame.shape)
         put_text(out, "START", (sx + 8, sy - 8), (0, 255, 0))
     put_text(out, status, (10, 470), (0, 255, 0))
-    put_text(out, "n:next s:lock a:aruco b:bg click+t:dot q:quit", (10, 20))
+    put_text(out, "n:next s:lock a:aruco c:recalib b:bg click+t:dot q:quit", (10, 20))
     return out
 
 
@@ -739,8 +894,10 @@ def main():
         if event == cv2.EVENT_LBUTTONDOWN:
             click["pt"] = flip_pt((x, y), (480, 640))   # 顯示畫面 → 相機像素
 
+    global MAIN_MOUSE
+    MAIN_MOUSE = on_mouse
     cv2.setMouseCallback(win, on_mouse)
-    load_tool_offset()
+    load_calibration()
 
     try:
         # --- GRIP：直接夾麥克筆 ---
@@ -751,12 +908,18 @@ def main():
         print("✊ 已夾緊")
 
         # --- 先定位 4 個角的 ArUco ---
-        print("\n[ArUco 定位] 筆尖會依序移到 4 個 Marker 中心上方，"
-              "用 i/k/j/l 微調到正中心後按 Enter，最後自動算出筆尖偏移")
-        locate_aruco(arm, pipeline, win)
+        ans = input("\n[ArUco] Enter: 檢查筆尖偏移   c: 換了 Marker/紙板/相機 → 完整重新校正   "
+                    "x: 跳過 > ").strip().lower()
+        if ans == "c":
+            recalibrate(arm, pipeline, win)
+        elif ans != "x":
+            locate_aruco(arm, pipeline, win)
+        else:
+            arm.home()
+            time.sleep(1.0)
 
         bg = load_background()
-        print("\n[預覽] n: 換物體 / s: 鎖定路徑 / a: 重新定位 ArUco / b: 拍底圖 / "
+        print("\n[預覽] n: 換物體 / s: 鎖定路徑 / a: 檢查筆尖偏移 / c: 完整重新校正 / b: 拍底圖 / "
               "點畫面+t: 點一個點 / q: 離開")
         sel = 0
 
@@ -778,6 +941,8 @@ def main():
                 sel += 1
             elif key == ord('a'):
                 locate_aruco(arm, pipeline, win)
+            elif key == ord('c'):
+                recalibrate(arm, pipeline, win)
             elif key == ord('b'):
                 bg = capture_background(pipeline)
             elif key == ord('t') and click["pt"]:
