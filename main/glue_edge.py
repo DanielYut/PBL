@@ -9,7 +9,7 @@
     GLUE_STEP_MM 越大越順、越小越貼邊緣
 
 流程：
-  [GRIP]    夾爪打開 → 你把麥克筆放進夾爪 (筆尖朝下) → 按 Enter → 夾緊
+  [GRIP]    開始時不打開夾爪，筆要先夾好 (程式只送一次夾緊)
   [ARUCO]   Enter：筆尖依序到 4 個角的 Marker，對準後按 Enter，
                    自動算出筆尖偏移並存檔 (data/aruco_xy_calib.json，下次自動載入)
             c    ：換了 Marker / 紙板 / 相機 → 完整重新校正：重新偵測 4 個 Marker，
@@ -32,7 +32,9 @@
 
 ⚠️ 第一次執行前要確認的值 (都在「1. 設定」)：
   Z_DRAW          筆尖碰到要畫的表面時的 Z (預設 None = 紙面 Z_PAPER + 物體高度，自動算)
-  OBJ_HEIGHT_MM   要畫在物體頂面 → 填物體高度；畫在紙上 (物體周圍) → 0
+  Z_PAPER         筆尖碰到「板面」時的 Z (用示教器量一次，板子不動就不用改)
+  DRAW_SURFACE    "top" = 畫在工件頂面；"board" = 畫在板面沿工件外圍
+  工件高度        AUTO_HEIGHT = True 時用深度自動量 (預覽畫面下方顯示，按 s 鎖定時連量取中位數)
   TOOL_OFFSET_X/Y 筆尖相對夾爪中心的偏移 (先用 t 點一個點檢查)
 """
 import json
@@ -61,7 +63,7 @@ RX_HOME, RY_HOME, RZ_HOME = -179.260, 1.185, -105.234
 # --- 高度 (TCP 的 Z) ---
 Z_DRAW = None           # 筆尖剛好碰到要畫的表面時的 Z。None = 自動用 Z_PAPER + OBJ_HEIGHT_MM
                         # (想直接指定就填數字，例如用示教器量到的物體頂面 Z)
-PEN_PRESS_MM = 0.5      # 再往下壓多少，讓筆尖確實接觸 (麥克筆筆頭軟，0.5~1 mm)
+PEN_PRESS_MM = -3      # 筆尖剛好碰到表面，不再往下壓 (要壓的話填正數 mm)
 Z_LIFT = 15.0           # 抬筆高度 (畫之前/之後停在表面上方幾 mm)
 Z_TRAVEL = 560.000      # 從 Home 過去 / 回來的安全高度
 Z_MIN = 395.0           # 安全下限，低於這個高度不准移動
@@ -70,20 +72,32 @@ SPEED_FAST = 40
 SPEED_DRAW = 70         # 畫線速度 (%)
 
 # --- 畫線路徑 ---
-OBJ_HEIGHT_MM = 0.0     # TODO: 畫在物體頂面 → 物體高度 mm；畫在紙上 → 0
-DRAW_OFFSET_MM = 0.0    # 路徑往外 (+) / 往內 (-) 偏多少 mm (例如畫在紙上沿物體外圍 → +3)
+OBJ_HEIGHT_MM = 0.0     # 沒有深度 (AUTO_HEIGHT 關掉 / 深度量不到) 時用的工件高度 mm
+
+# --- 自動量工件高度 (RealSense 深度) ---
+# 高度 = 工件周圍板面的深度 - 工件頂面的深度 (相對量，板面的絕對 Z 還是用 Z_PAPER)
+AUTO_HEIGHT = True          # True = 用深度自動量高度；False = 用上面的 OBJ_HEIGHT_MM
+DRAW_SURFACE = "top"        # "top"  : 畫在工件頂面   (Z = Z_PAPER + 量到的高度)
+                            # "board": 畫在板面沿工件外圍 (Z = Z_PAPER，高度只拿來修正視差)
+HEIGHT_INNER_ERODE_PX = 8   # 工件內部往內縮幾 px 再量 (邊緣的深度不準)
+HEIGHT_RING_PX = (10, 30)   # 工件外圍第幾 px 到第幾 px 的一圈當作板面
+HEIGHT_MAX_MM = 150.0       # 量到超過這個高度 → 當作量錯
+DRAW_OFFSET_PX = -2.0   # 路徑往外 (+) / 往內 (-) 偏幾 px (在影像上沿邊緣法線移，每個邊都一樣)。-2 = 每邊內縮 2 px
+DRAW_OFFSET_MM = 0.0    # 另外再偏幾 mm (在手臂座標沿法線移)，跟上面的 px 會相加。0 = 不用
 
 # --- 塗膠路徑 (沿邊緣，不簡化成特徵點) ---
 GLUE_STEP_MM = 3.0      # 沿邊緣每隔幾 mm 取一點 (每一點 = 一小段 MovL)。越小越貼邊、越多停頓
 SMOOTH_PX = 7           # 邊緣平滑：前後幾個像素取平均，去掉像素鋸齒 (1 = 不平滑；要奇數)
+MASK_BLUR_PX = 2.0      # 取邊緣前先把工件遮罩模糊 (σ px) 再二值化，磨掉階梯 / 小凸起 (0 = 不做；越大尖角越圓)
+LOCK_FRAMES = 15        # 按 s 鎖定時連拍幾張：遮罩平均 (去邊緣雜訊) + 高度取中位數
 GLUE_OVERLAP_MM = 5.0   # 走完一圈回到起點後再多走幾 mm，讓膠線頭尾接起來 (0 = 不重疊)
 SPEED_GLUE = SPEED_DRAW # 塗膠速度 (%)
 GLUE_PAUSE_S = 0.0      # 每段走到點之後額外停幾秒 (0 = 一到位馬上走下一段，最流暢)
 GLUE_EARLY_MM = 1.0     # 提前送點：離這段終點剩幾 mm 就先送下一段 (控制器接受 → 不停直接轉過去；
                         # 控制器忽略 → 程式偵測到會補送，不會卡)。0 = 關閉 (每段都等到位)
                         # 轉角會被切掉最多約這麼多 mm，越大越順、越不貼角
-GLUE_MERGE_TOL_MM = 0.3 # 直的地方合成一段：拿掉後路徑離真實邊緣不超過幾 mm 的點就拿掉
-                        # (直邊 → 一條直線不停；彎的地方點照樣密。0 = 不合併，每 GLUE_STEP_MM 一段)
+GLUE_MERGE_TOL_MM = 0.5 # 路徑跟邊緣最多差幾 mm。用最少段數走完：直邊 = 一整段，只有彎的地方切段
+                        # 越大段數越少、越順 (停頓少)，越小越貼邊。0 = 不合併，改成每 GLUE_STEP_MM 一段
 
 # --- 工具偏移 (筆尖相對夾爪中心) ---
 # ArUco 定位時微調對準並按 Enter 記錄，程式會自動算出偏移存到 data/aruco_xy_calib.json，
@@ -95,11 +109,12 @@ TOOL_OFFSET_Y = 0.0
 DISPLAY_ROTATE_180 = True   # 相機畫面跟實際看到的上下左右相反 → 轉 180° 顯示 (只影響顯示，不影響計算)
 
 # --- ArUco 定位 (畫之前先讓筆尖到 4 個角的 Marker 中心，確認位置準不準) ---
-Z_PAPER = 436.157       # 筆尖碰到「紙面」時的 Z (2026-11-05 示教器實測)
+Z_PAPER = 435.141# 筆尖碰到「白板板面」時的 Z (2026-11-16 示教器實測；換板子要重量)
                         # ※ 高度只用這裡 (或 Z_DRAW) 的值，校正不會改 Z
 ARUCO_HOVER_MM = 10.0   # 停在 Marker 上方幾 mm
 ARUCO_DICT = cv2.aruco.DICT_5X5_50
 ARUCO_MATCH_PX = 40     # 偵測到的 Marker 跟記錄位置差多少 px 內算同一個
+TEACH_MAX_ABOVE_MM = 30.0   # 教點按 Enter 時筆尖最多比板面高幾 mm，超過 = 還沒移過去，不記錄
 TEACH_WITH_PENDANT = True   # True = 用示教器教點 (程式只讀座標，不動手臂)；False = 程式移過去，用鍵盤微調
 
 # 工作範圍限制 (程式自己擋)。None = 不限制，由手臂控制器判斷 (奇異點/到不了時控制器會報警、不執行)
@@ -327,6 +342,8 @@ def object_mask(img, bg):
         cv2.drawContours(mask, cnts, -1, 255, -1)
 
     mask &= paper
+    if ARUCO_EXCLUDE is not None and ARUCO_EXCLUDE.shape == mask.shape:
+        mask[ARUCO_EXCLUDE > 0] = 0          # Marker 不算物體
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
 
@@ -337,6 +354,107 @@ def detect_objects(img, bg):
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     cnts = [c for c in cnts if MIN_AREA < cv2.contourArea(c) < MAX_AREA]
     return sorted(cnts, key=cv2.contourArea, reverse=True), mask
+
+
+def measure_height(cnt, obj_mask, depth):
+    """
+    工件高度 mm = 外圍一圈板面深度的中位數 - 工件內部深度的中位數。量不到回傳 None
+    obj_mask = 所有物體的遮罩 (外圍那圈要扣掉別的物體)
+    """
+    if depth is None or depth.shape[:2] != obj_mask.shape[:2]:
+        return None
+    fill = np.zeros(obj_mask.shape[:2], np.uint8)
+    cv2.drawContours(fill, [cnt], -1, 255, -1)
+
+    def ell(r):
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    inner = cv2.erode(fill, ell(HEIGHT_INNER_ERODE_PX))
+    if cv2.countNonZero(inner) < 20:                      # 工件太小 → 少縮一點
+        inner = cv2.erode(fill, ell(2))
+    r_in, r_out = HEIGHT_RING_PX
+    ring = cv2.dilate(fill, ell(r_out)) & ~cv2.dilate(fill, ell(r_in)) & ~cv2.dilate(obj_mask, ell(r_in))
+    if ARUCO_EXCLUDE is not None and ARUCO_EXCLUDE.shape == ring.shape:
+        ring &= ~ARUCO_EXCLUDE
+    d_in = depth[(inner > 0) & (depth > 0)]
+    d_ring = depth[(ring > 0) & (depth > 0)]
+    if len(d_in) < 15 or len(d_ring) < 30:
+        return None
+    h = float(np.median(d_ring) - np.median(d_in))
+    if not -5.0 <= h <= HEIGHT_MAX_MM:
+        return None
+    return max(h, 0.0)
+
+
+def lock_object(pipeline, bg, cnt):
+    """
+    按 s 鎖定時連拍 LOCK_FRAMES 張，找同一個工件：
+      - 邊緣：每張的工件遮罩加起來平均，超過一半的張數都算工件的像素才保留
+              → 每張邊界亂跳的 1~3 px 雜訊會抵消，路徑的鋸齒少很多
+      - 高度 (有深度時)：每張量一次取中位數
+    回傳 (平均後的輪廓 或 None, 高度 或 None, 高度跳動 = 90% - 10% 分位 或 None)
+    """
+    m = cv2.moments(cnt)
+    if not m["m00"]:
+        return None, None, None
+    c0 = np.array([m["m10"] / m["m00"], m["m01"] / m["m00"]])
+    acc, n_ok, hs = None, 0, []
+    for _ in range(LOCK_FRAMES):
+        f = grab(pipeline)
+        cs, msk = detect_objects(f, bg)
+        best = None
+        for c in cs:                                   # 找同一個工件 (中心最近的)
+            mm = cv2.moments(c)
+            if mm["m00"]:
+                dd = float(np.hypot(*(np.array([mm["m10"] / mm["m00"], mm["m01"] / mm["m00"]]) - c0)))
+                if dd < 20 and (best is None or dd < best[0]):
+                    best = (dd, c, msk)
+        if not best:
+            continue
+        fill = np.zeros(f.shape[:2], np.uint8)
+        cv2.drawContours(fill, [best[1]], -1, 1, -1)
+        acc = fill.astype(np.float32) if acc is None else acc + fill
+        n_ok += 1
+        if DEPTH_ON:
+            h = measure_height(best[1], best[2], LAST_DEPTH)
+            if h is not None:
+                hs.append(h)
+
+    avg_cnt = None
+    if n_ok >= max(3, LOCK_FRAMES // 3):
+        avg = ((acc / n_ok) >= 0.5).astype(np.uint8) * 255
+        cs, _ = cv2.findContours(avg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if cs:
+            avg_cnt = max(cs, key=cv2.contourArea)
+    if len(hs) < max(3, LOCK_FRAMES // 3):
+        return avg_cnt, None, None
+    return avg_cnt, float(np.median(hs)), float(np.percentile(hs, 90) - np.percentile(hs, 10))
+
+
+DEBUG_DIR = os.path.join(DATA_DIR, "debug")
+
+
+def save_debug(frame, mask, cnts, sel, path_px, bg):
+    """p：存下目前畫面 / 物體遮罩 / 疊圖 / 深度，用來檢查偵測問題"""
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    tag = time.strftime("%Y%m%d_%H%M%S")
+    base = os.path.join(DEBUG_DIR, tag)
+    cv2.imwrite(base + "_frame.png", frame)
+    cv2.imwrite(base + "_mask.png", mask)
+    ov = frame.copy()
+    for i, c in enumerate(cnts):
+        cv2.drawContours(ov, [c], -1, (0, 255, 255) if i != sel else (0, 0, 255), 1)
+    if len(path_px) > 1:
+        cv2.polylines(ov, [np.int32(path_px)], False, (255, 0, 0), 1)
+    cv2.imwrite(base + "_overlay.png", ov)
+    if bg is not None:
+        cv2.imwrite(base + "_bg.png", bg)
+    if LAST_DEPTH is not None:
+        np.save(base + "_depth.npy", LAST_DEPTH)
+    print(f"💾 已存偵測快照 {base}_*.png  (模式：{'背景相減' if bg is not None else '顏色'})")
+    if cnts:
+        x, y, w, h = cv2.boundingRect(cnts[sel])
+        print(f"   選中物體外框 {w} x {h} px ≈ {w * MM_PER_PX:.1f} x {h * MM_PER_PX:.1f} mm (板面高度換算)，"
+              f"高度 {obj_height():.1f} mm")
 
 
 def load_background():
@@ -366,12 +484,13 @@ def make_path(cnt, shape):
     物體邊緣 → (路徑像素點, 路徑手臂點)。沿邊緣等距取點，走一圈回到起點 (+ 重疊段)
     DRAW_OFFSET_MM 用遮罩膨脹/侵蝕做出外擴/內縮
     """
-    if DRAW_OFFSET_MM:
+    if MASK_BLUR_PX > 0:
         m = np.zeros(shape[:2], np.uint8)
         cv2.drawContours(m, [cnt], -1, 255, -1)
-        r = max(1, int(round(abs(DRAW_OFFSET_MM) / MM_PER_PX)))
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-        m = cv2.dilate(m, k) if DRAW_OFFSET_MM > 0 else cv2.erode(m, k)
+        if MASK_BLUR_PX > 0:
+            # 遮罩先模糊再取一半 → 階梯、小凸起被磨平，形狀大小不變 (直邊不動，只有尖角會稍微變圓)
+            k = 2 * int(round(3 * MASK_BLUR_PX)) + 1
+            m = ((cv2.GaussianBlur(m, (k, k), MASK_BLUR_PX)) >= 128).astype(np.uint8) * 255
         cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         if not cs:
             return [], []
@@ -391,29 +510,58 @@ def make_path(cnt, shape):
                                 np.convolve(ext[:, 1], kernel, "valid")])
 
     # 3. 每個邊緣點換成手臂座標 (含高度視差修正)
-    arm_all = np.array([pixel_to_arm(u, v, OBJ_HEIGHT_MM) for u, v in edge])
+    arm_all = np.array([pixel_to_arm(u, v, obj_height()) for u, v in edge])
 
-    # 4. 沿邊緣「等距」重新取點 (用手臂的 mm 算距離)，每 GLUE_STEP_MM 一點
-    loop_arm = np.vstack([arm_all, arm_all[:1]])          # 封閉
+    # 4. 內縮 / 外擴：在手臂座標 (mm) 沿邊緣法線移，比遮罩侵蝕 (一次至少 1 px ≈ 0.7 mm) 精準
+    if DRAW_OFFSET_MM:
+        arm_all = offset_closed(arm_all, DRAW_OFFSET_MM)
+
+    # 5. 封閉一圈 + 回到起點後沿原路多走 GLUE_OVERLAP_MM (膠線頭尾接上)
+    loop_arm = np.vstack([arm_all, arm_all[:1]])
     loop_px = np.vstack([edge, edge[:1]])
     seg = np.hypot(*np.diff(loop_arm, axis=0).T)
     s = np.concatenate([[0.0], np.cumsum(seg)])            # 每個邊緣點的累積長度
     total = s[-1]
-    n = max(3, int(round(total / GLUE_STEP_MM)))
-    t = list(np.linspace(0.0, total, n + 1))               # 一圈：起點 … 回到起點
-    # 回到起點後再沿原路多走 GLUE_OVERLAP_MM，讓膠線頭尾接上
     ov = min(GLUE_OVERLAP_MM, total)
-    if ov > 0:
-        t += list(np.arange(GLUE_STEP_MM, ov, GLUE_STEP_MM)) + [ov]
 
-    ax, ay = np.interp(t, s, loop_arm[:, 0]), np.interp(t, s, loop_arm[:, 1])
-    pu, pv = np.interp(t, s, loop_px[:, 0]), np.interp(t, s, loop_px[:, 1])
+    if GLUE_MERGE_TOL_MM > 0:
+        # 6a. 段數越少越順：直接拿「全部」邊緣點，找出誤差 < GLUE_MERGE_TOL_MM 的最少段數
+        #     (直邊 = 一整段；只有彎的地方才切段，彎越急段越短)
+        k = int(np.searchsorted(s, ov)) if ov > 0 else 0
+        tail_a = [loop_arm[1:k]] if k > 1 else []
+        tail_p = [loop_px[1:k]] if k > 1 else []
+        if ov > 0:                                          # 重疊段的終點 (內插)
+            tail_a.append([[np.interp(ov, s, loop_arm[:, 0]), np.interp(ov, s, loop_arm[:, 1])]])
+            tail_p.append([[np.interp(ov, s, loop_px[:, 0]), np.interp(ov, s, loop_px[:, 1])]])
+        all_a = np.vstack([loop_arm] + tail_a)
+        all_p = np.vstack([loop_px] + tail_p)
+        keep = merge_straight(all_a, GLUE_MERGE_TOL_MM)
+        ax, ay = all_a[keep, 0], all_a[keep, 1]
+        pu, pv = all_p[keep, 0], all_p[keep, 1]
+    else:
+        # 6b. 不合併：每 GLUE_STEP_MM 一段 (舊做法，段很多、停頓多)
+        n = max(3, int(round(total / GLUE_STEP_MM)))
+        t = list(np.linspace(0.0, total, n + 1))
+        if ov > 0:
+            t += list(np.arange(GLUE_STEP_MM, ov, GLUE_STEP_MM)) + [ov]
+        ax, ay = np.interp(t, s, loop_arm[:, 0]), np.interp(t, s, loop_arm[:, 1])
+        pu, pv = np.interp(t, s, loop_px[:, 0]), np.interp(t, s, loop_px[:, 1])
 
-    # 5. 直的地方合成一段 (少停幾次)：拿掉「拿掉後偏離不超過 GLUE_MERGE_TOL_MM」的點
-    keep = merge_straight(np.column_stack([ax, ay]), GLUE_MERGE_TOL_MM)
-    arm = [(float(ax[i]), float(ay[i])) for i in keep]
-    px = [(int(round(pu[i])), int(round(pv[i]))) for i in keep]
+    arm = [(float(x), float(y)) for x, y in zip(ax, ay)]
+    px = [(int(round(u)), int(round(v))) for u, v in zip(pu, pv)]
     return px, arm
+
+
+def offset_closed(pts, d):
+    """封閉曲線每一點沿法線移 d mm (+ 往外 / - 往內)"""
+    nxt, prv = np.roll(pts, -1, axis=0), np.roll(pts, 1, axis=0)
+    t = nxt - prv                                           # 切線
+    t /= np.maximum(np.hypot(t[:, 0], t[:, 1]), 1e-9)[:, None]
+    area = 0.5 * np.sum(pts[:, 0] * nxt[:, 1] - nxt[:, 0] * pts[:, 1])
+    n = np.column_stack([t[:, 1], -t[:, 0]])                # 逆時針時是往外
+    if area < 0:
+        n = -n
+    return pts + d * n
 
 
 def merge_straight(pts, tol):
@@ -458,9 +606,21 @@ def path_length(arm_pts):
 # ==========================================
 # 6. 動作
 # ==========================================
+CUR_HEIGHT = None   # 目前選中工件量到的高度 mm (None = 量不到 → 用 OBJ_HEIGHT_MM)
+
+
+def obj_height():
+    """工件高度：有量到就用量到的，否則用 OBJ_HEIGHT_MM"""
+    if AUTO_HEIGHT and CUR_HEIGHT is not None:
+        return CUR_HEIGHT
+    return OBJ_HEIGHT_MM
+
+
 def draw_z():
     """筆尖碰到要畫的表面時的 Z"""
-    return Z_DRAW if Z_DRAW is not None else Z_PAPER + OBJ_HEIGHT_MM
+    if Z_DRAW is not None:
+        return Z_DRAW
+    return Z_PAPER + (obj_height() if DRAW_SURFACE == "top" else 0.0)
 
 
 def run_glue_segments(arm, pts, z, tol=1.0, timeout=30.0):
@@ -547,6 +707,48 @@ def draw_path(arm, pts):
     xe, ye = pts[-1]
     arm.move(xe, ye, z_up, speed=SPEED_GLUE)                   # 抬筆 (在終點原地抬起)
     arm.move(xe, ye, Z_TRAVEL)
+
+
+ARUCO_EXCLUDE_PAD_PX = 15   # Marker 外框再往外多排除幾 px (白邊 + 偵測誤差)
+ARUCO_EXCLUDE = None        # 排除遮罩 (相機像素，255 = 不偵測物體)
+
+
+def build_aruco_exclude(pipeline, n_frames=10):
+    """
+    手臂在 Home 時呼叫：偵測 Marker 外框做成排除遮罩，物體偵測就不會把 Marker 當成物體。
+    Marker 跟 Home 都固定，所以做一次就好 (a / c 校正完會自動重做)。
+    沒偵測到的 Marker (例如被東西擋住)：用校正記錄的中心 PTS_PIXEL + 其他 Marker 的平均大小補一個方框
+    """
+    global ARUCO_EXCLUDE
+    d = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
+    acc, frame = {}, None
+    for _ in range(n_frames):
+        frame = grab(pipeline)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if hasattr(cv2.aruco, "ArucoDetector"):
+            corners, ids, _ = cv2.aruco.ArucoDetector(d, cv2.aruco.DetectorParameters()).detectMarkers(gray)
+        else:
+            corners, ids, _ = cv2.aruco.detectMarkers(gray, d, parameters=cv2.aruco.DetectorParameters_create())
+        if ids is not None:
+            for i, c in zip(ids.flatten(), corners):
+                acc.setdefault(int(i), []).append(c.reshape(4, 2))
+    polys = [np.mean(v, axis=0) for v in acc.values()]
+    n_found = len(polys)
+    # 邊長 ≈ 對角線 / √2；都沒偵測到就假設 50 px
+    side = float(np.mean([np.linalg.norm(q[0] - q[2]) for q in polys])) / math.sqrt(2) if polys else 50.0
+    for u, v in PTS_PIXEL:
+        if all(math.hypot(*(q.mean(axis=0) - (u, v))) > ARUCO_MATCH_PX for q in polys):
+            h = side / 2
+            polys.append(np.float32([[u - h, v - h], [u + h, v - h], [u + h, v + h], [u - h, v + h]]))
+    mask = np.zeros(frame.shape[:2], np.uint8)
+    for q in polys:
+        cv2.fillConvexPoly(mask, np.int32(np.round(q)), 255)
+    k = 2 * ARUCO_EXCLUDE_PAD_PX + 1
+    ARUCO_EXCLUDE = cv2.dilate(mask, np.ones((k, k), np.uint8))
+    extra = len(polys) - n_found
+    print(f"🔲 物體偵測排除 Marker：偵測到 {n_found} 個" +
+          (f"，另外 {extra} 個沒偵測到、用校正位置補" if extra else "") +
+          f" (外擴 {ARUCO_EXCLUDE_PAD_PX} px，畫面上灰框)")
 
 
 def detect_aruco(pipeline, n_frames=10, dict_id=None):
@@ -741,7 +943,11 @@ def save_calibration(taught, dict_name):
     for (u, v, x, y) in taught:
         print(f"  像素 ({u:6.1f}, {v:6.1f}) → X={x:.3f}, Y={y:.3f}")
     print(f"  4 邊的 mm/px：{', '.join(f'{s:.3f}' for s in sc)}  (舊的平均 {MM_PER_PX:.3f})")
-    if (max(sc) - min(sc)) / np.mean(sc) > 0.15:   # 相機有點斜，舊校正本身就差 ~8%
+    ratio = (max(sc) - min(sc)) / np.mean(sc)
+    if ratio > 0.30:
+        print(f"  ❌ 4 邊比例差 {ratio:.0%} (> 30%)，一定有點教錯 (沒移過去就按 Enter / 順序錯)，不存。請重做")
+        return False
+    if ratio > 0.15:   # 相機有點斜，舊校正本身就差 ~8%
         print("  ⚠️ 4 邊比例差超過 15%，可能有點對歪或順序教錯了，建議重做")
     if ask("  要套用並存檔嗎？(y/n) > ", ("y", "n")) != "y":
         print("  沒有存")
@@ -858,6 +1064,15 @@ def teach_with_pendant(arm, pipeline, win, targets, recalib=None):
 
             if key in (13, 10):
                 p = arm.pose()
+                # 防呆：筆尖離板子太高 = 手臂根本還沒移到 Marker (例如還在 Home)，不記錄
+                if p[2] > Z_PAPER + TEACH_MAX_ABOVE_MM:
+                    print(f"   ⚠️ 現在 Z={p[2]:.1f}，比板面高 {p[2] - Z_PAPER:.0f} mm，手臂還沒移到 Marker？"
+                          f"沒有記錄。筆尖碰到 Marker 中心後再按 Enter")
+                    continue
+                # 防呆：跟已經教過的點太近 = 同一個位置按了兩次
+                if any(math.hypot(p[0] - t[2], p[1] - t[3]) < 20 for t in taught):
+                    print(f"   ⚠️ X={p[0]:.1f}, Y={p[1]:.1f} 跟前面教過的點幾乎一樣，沒有記錄。移到這一點的 Marker 再按 Enter")
+                    continue
                 dx, dy = p[0] - x, p[1] - y
                 corrections.append((name, dx, dy))
                 taught.append((u, v, p[0], p[1]))
@@ -1038,21 +1253,91 @@ def dot_at(arm, x, y):
     """在 (x, y) 點一個點，用來檢查偏移量"""
     print(f"• 點一個點 @ ({x:.2f}, {y:.2f})")
     arm.move(x, y, Z_TRAVEL)
-    arm.move(x, y, draw_z() + Z_LIFT)
-    arm.move(x, y, draw_z() - PEN_PRESS_MM, speed=SPEED_DRAW)
+    arm.move(x, y, Z_PAPER + Z_LIFT)                              # 點在板面上
+    arm.move(x, y, Z_PAPER - PEN_PRESS_MM, speed=SPEED_DRAW)
     time.sleep(0.3)
-    arm.move(x, y, draw_z() + Z_LIFT, speed=SPEED_DRAW)
+    arm.move(x, y, Z_PAPER + Z_LIFT, speed=SPEED_DRAW)
     arm.move(x, y, Z_TRAVEL)
 
 
 # ==========================================
 # 7. 畫面
 # ==========================================
-def grab(pipeline):
-    while True:
-        f = pipeline.wait_for_frames().get_color_frame()
-        if f:
-            return np.asanyarray(f.get_data())
+CAM_CFG = None      # main() 開相機時存起來，斷流時用來重新啟動
+DEPTH_ON = False    # 深度串流有開成功
+ALIGN = None        # 深度對齊到彩色 (同一個像素 = 同一個點)
+DEPTH_SCALE = 0.001 # 深度單位 → 公尺
+LAST_DEPTH = None   # 最近一次 grab 的深度圖 (mm，float32，0 = 量不到)
+
+
+def start_camera(pipeline):
+    """
+    開相機 (彩色；AUTO_HEIGHT 時加開深度)，印出 USB 版本 (USB 2.x 頻寬不夠，容易 Frame didn't arrive)
+    深度開不起來 → 只用彩色，高度改用 OBJ_HEIGHT_MM
+    """
+    global CAM_CFG, DEPTH_ON, ALIGN, DEPTH_SCALE
+    profile = None
+    if AUTO_HEIGHT:
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        try:
+            profile = pipeline.start(cfg)
+            DEPTH_ON = True
+            ALIGN = rs.align(rs.stream.color)
+            DEPTH_SCALE = profile.get_device().first_depth_sensor().get_depth_scale()
+            print("📏 深度已開啟：自動量工件高度")
+        except Exception as e:
+            print(f"⚠️ 深度開不起來 ({e})，只用彩色，工件高度用 OBJ_HEIGHT_MM = {OBJ_HEIGHT_MM}")
+    if profile is None:
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        profile = pipeline.start(cfg)
+        DEPTH_ON = False
+    CAM_CFG = cfg
+    try:
+        usb = profile.get_device().get_info(rs.camera_info.usb_type_descriptor)
+        print(f"📷 RealSense 連線：USB {usb}" + ("  ⚠️ 不是 USB 3，容易掉幀，請換 USB 3 孔 / 線" if usb.startswith("2") else ""))
+    except Exception:
+        pass
+    return profile
+
+
+def grab(pipeline, timeout_ms=2000, retries=3):
+    """
+    拿一張彩色影像。相機斷流 (USB 鬆動 / 頻寬不夠) 時不要直接整個程式掛掉：
+    先重試，還是不行就重新啟動相機串流，都失敗才丟錯誤
+    """
+    global LAST_DEPTH
+    for attempt in range(retries + 1):
+        try:
+            for _ in range(10):
+                frames = pipeline.wait_for_frames(timeout_ms)
+                if DEPTH_ON:
+                    frames = ALIGN.process(frames)
+                f = frames.get_color_frame()
+                if f:
+                    if DEPTH_ON:
+                        d = frames.get_depth_frame()
+                        LAST_DEPTH = (np.asanyarray(d.get_data()).astype(np.float32) * (DEPTH_SCALE * 1000.0)
+                                      if d else None)
+                    return np.asanyarray(f.get_data())
+        except RuntimeError as e:
+            print(f"⚠️ 相機 {timeout_ms / 1000:.0f} 秒沒有影像 ({e})")
+        if attempt == retries or CAM_CFG is None:
+            break
+        print(f"   第 {attempt + 1}/{retries} 次重新啟動相機...")
+        try:
+            pipeline.stop()
+        except Exception:
+            pass
+        time.sleep(1.0)
+        try:
+            pipeline.start(CAM_CFG)
+        except Exception as e:
+            print(f"   重新啟動失敗：{e}")
+    raise RuntimeError("相機一直收不到影像：檢查 USB 線有沒有鬆、是不是插在 USB 3 孔，"
+                       "或用 realsense-viewer 確認相機正常")
 
 
 def put_text(img, text, org, color=(255, 255, 255), scale=0.5):
@@ -1084,12 +1369,15 @@ def render(frame, cnts, sel, path_px, click, status):
         cv2.circle(out, path_px[0], 6, (0, 255, 0), -1)       # 起點
     if click:
         cv2.drawMarker(out, click, (255, 0, 255), cv2.MARKER_CROSS, 18, 2)
+    if ARUCO_EXCLUDE is not None:
+        ex, _ = cv2.findContours(ARUCO_EXCLUDE, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, ex, -1, (160, 160, 160), 1)   # 不偵測物體的 Marker 區域
     out = to_display(out)
     if len(path_px) > 1:
         sx, sy = flip_pt(path_px[0], frame.shape)
         put_text(out, "START", (sx + 8, sy - 8), (0, 255, 0))
     put_text(out, status, (10, 470), (0, 255, 0))
-    put_text(out, "(keys in terminal) n:next s:lock a:aruco c:recalib b:bg t:dot q:quit", (10, 20))
+    put_text(out, "(keys in terminal) n:next s:lock a:aruco c:recalib b:bg t:dot p:snap q:quit", (10, 20))
     return out
 
 
@@ -1097,23 +1385,19 @@ def render(frame, cnts, sel, path_px, click, status):
 # 8. 主程式
 # ==========================================
 def main():
+    global CUR_HEIGHT
     arm = Arm()
     pipeline = rs.pipeline()
-    cfg = rs.config()
-    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    pipeline.start(cfg)
+    start_camera(pipeline)
     win = "Glue Edge"
     cv2.namedWindow(win)
     click = {"pt": None}   # 上次用 t 點點的位置 (相機像素)，預覽畫面上畫紫色十字
     load_calibration()
 
     try:
-        # --- GRIP：直接夾麥克筆 ---
-        print("\n[夾筆] 夾爪打開")
-        arm.grip(close=False)
-        ask("把麥克筆放進夾爪 (筆尖朝下、對正)，放好後按 Enter 夾緊 > ")
+        # --- GRIP：筆已經在夾爪上，開始時不打開夾爪 (只確保夾緊) ---
         arm.grip(close=True)
-        print("✊ 已夾緊")
+        print("\n✊ 夾爪保持夾緊 (開始時不會打開)")
 
         # --- 先定位 4 個角的 ArUco ---
         ans = ask("\n[ArUco] Enter: 檢查筆尖偏移   c: 換了 Marker/紙板/相機 → 完整重新校正   "
@@ -1127,21 +1411,30 @@ def main():
             time.sleep(1.0)
 
         bg = load_background()
+        build_aruco_exclude(pipeline)
         def preview_help():
             print("\n[預覽] (在終端機按，不用按 Enter) n: 換物體 / s: 鎖定路徑 / a: 檢查筆尖偏移 / "
-                  "c: 完整重新校正 / b: 拍底圖 / t: 選位置點一個點 / q: 離開")
+                  "c: 完整重新校正 / b: 拍底圖 / t: 選位置點一個點 / p: 存偵測快照 / q: 離開")
         preview_help()
         flush_keys()
         sel = 0
+        h_ema = None      # 即時量到的高度 (平滑後)
 
         while True:
             # --- DETECT ---
             frame = grab(pipeline)
             cnts, mask = detect_objects(frame, bg)
             sel = sel % len(cnts) if cnts else 0
+            if DEPTH_ON and cnts:
+                h = measure_height(cnts[sel], mask, LAST_DEPTH)
+                if h is not None:                      # 平滑，畫面上數字/路徑才不會一直跳
+                    h_ema = h if h_ema is None else 0.7 * h_ema + 0.3 * h
+                CUR_HEIGHT = h_ema
             path_px, path_arm = make_path(cnts[sel], frame.shape) if cnts else ([], [])
             status = (f"object {sel + 1}/{len(cnts)}  segments {max(len(path_arm) - 1, 0)}  "
                       f"length {path_length(path_arm):.0f}mm" if path_arm else "no object")
+            if DEPTH_ON and cnts:
+                status += f"  height {CUR_HEIGHT:.1f}mm" if CUR_HEIGHT is not None else "  height ?"
             cv2.imshow(win, render(frame, cnts, sel, path_px, click["pt"], status))
             cv2.imshow("Object Mask", to_display(mask))
             key = poll_key(1)
@@ -1152,13 +1445,18 @@ def main():
                 break
             if key == ord('n'):
                 sel += 1
+                h_ema = None
                 print(f"  → 物體 {sel % len(cnts) + 1}/{len(cnts)}" if cnts else "  ⚠️ 沒有偵測到物體")
             elif key == ord('a'):
                 locate_aruco(arm, pipeline, win)
+                build_aruco_exclude(pipeline)
             elif key == ord('c'):
                 recalibrate(arm, pipeline, win)
+                build_aruco_exclude(pipeline)
             elif key == ord('b'):
                 bg = capture_background(pipeline)
+            elif key == ord('p'):
+                save_debug(frame, mask, cnts, sel, path_px, bg)
             elif key == ord('t'):
                 # 起始位置：上次點的地方 → 選中物體的中心 → 畫面中央
                 start = click["pt"]
@@ -1168,14 +1466,14 @@ def main():
                 if start is None:
                     start = (frame.shape[1] / 2, frame.shape[0] / 2)
                 pt = pick_point(pipeline, win, start, "DOT position",
-                                live_overlay=lambda u, v: "arm X=%.2f Y=%.2f" % pixel_to_arm(u, v, OBJ_HEIGHT_MM))
+                                live_overlay=lambda u, v: "arm X=%.2f Y=%.2f" % pixel_to_arm(u, v, 0.0))
                 if pt is None:
                     print("  已取消")
                     flush_keys()
                     preview_help()
                     continue
                 click["pt"] = (int(round(pt[0])), int(round(pt[1])))
-                x, y = pixel_to_arm(*pt, OBJ_HEIGHT_MM)
+                x, y = pixel_to_arm(*pt, 0.0)
                 print(f"  點點位置 X={x:.2f}, Y={y:.2f}")
                 if path_ok([(x, y)]):
                     dot_at(arm, x, y)
@@ -1189,6 +1487,24 @@ def main():
                 if not path_arm:
                     print("⚠️ 沒有偵測到物體")
                     continue
+                # 連拍 LOCK_FRAMES 張：遮罩平均 (邊緣雜訊抵消) + 高度取中位數
+                lock_cnt, h, spread = lock_object(pipeline, bg, cnts[sel])
+                if DEPTH_ON:
+                    if h is None:
+                        CUR_HEIGHT = None
+                        print(f"⚠️ 深度量不到這個工件的高度 (黑色/反光/太小？)，改用 OBJ_HEIGHT_MM = {OBJ_HEIGHT_MM} mm")
+                    else:
+                        CUR_HEIGHT = h
+                        print(f"\n📏 工件高度 {h:.1f} mm (連量 {LOCK_FRAMES} 張，跳動 {spread:.1f} mm)"
+                              + ("  ⚠️ 跳動偏大，量測可能不穩" if spread > 3 else ""))
+                if lock_cnt is None:
+                    print("  (多張平均失敗，用目前這一張的邊緣)")
+                    lock_cnt = cnts[sel]
+                path_px, path_arm = make_path(lock_cnt, frame.shape)   # 用平均後的邊緣 + 鎖定的高度重算
+                if not path_arm:
+                    print("⚠️ 路徑算不出來")
+                    continue
+                cnts[sel] = lock_cnt
                 xs, ys = [p[0] for p in path_arm], [p[1] for p in path_arm]
                 print(f"\n========== 塗膠路徑 ==========")
                 print(f"  {len(path_arm) - 1} 小段，總長 {path_length(path_arm):.0f} mm，"
@@ -1196,7 +1512,7 @@ def main():
                 print(f"  起點 X={xs[0]:.2f}, Y={ys[0]:.2f}")
                 print(f"  範圍 X {min(xs):.2f} ~ {max(xs):.2f}，Y {min(ys):.2f} ~ {max(ys):.2f}")
                 print(f"  塗膠高度 Z={draw_z() - PEN_PRESS_MM:.3f} (紙面 {Z_PAPER:.3f} + 物體高度 "
-                      f"{OBJ_HEIGHT_MM} mm - 下壓 {PEN_PRESS_MM} mm)")
+                      f"{obj_height():.1f} mm" + (" (畫在板面，不加)" if DRAW_SURFACE != "top" else "") + f" - 下壓 {PEN_PRESS_MM} mm)")
                 if not path_ok(path_arm):
                     print("⚠️ 路徑超出工作範圍，不執行")
                     continue
