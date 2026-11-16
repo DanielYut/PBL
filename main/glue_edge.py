@@ -509,6 +509,10 @@ def make_path(cnt, shape):
         edge = np.column_stack([np.convolve(ext[:, 0], kernel, "valid"),
                                 np.convolve(ext[:, 1], kernel, "valid")])
 
+    # 3a. 內縮 / 外擴 (px)：在影像上沿邊緣法線移 DRAW_OFFSET_PX，每個邊都一樣
+    if DRAW_OFFSET_PX:
+        edge = offset_closed(edge, DRAW_OFFSET_PX)
+
     # 3. 每個邊緣點換成手臂座標 (含高度視差修正)
     arm_all = np.array([pixel_to_arm(u, v, obj_height()) for u, v in edge])
 
