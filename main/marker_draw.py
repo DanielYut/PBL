@@ -12,14 +12,14 @@
   [DETECT]  預覽畫面：偵測白紙上的物體，算出邊緣路徑 (藍線)。畫面已轉 180° 跟實際方向一致
               a: 重新做 ArUco 定位
               n: 換下一個物體   s: 鎖定路徑
-  [CONFIRM] 終端機印出路徑點 → y 開始畫 / 其他鍵取消
+  [CONFIRM] 終端機印出路徑點 → 終端機回答 y 開始畫 / n 取消
   [DRAW]    到第 1 點上方 → 下筆 → 沿邊緣直線移動一圈 → 抬筆
   [HOME]    回拍照位置，回到 DETECT
   結束時 (q) 問你要不要鬆開夾爪
 
-其他按鍵：
+其他按鍵 (所有按鍵都在「終端機」按，影像視窗只負責顯示)：
   b : 拍底圖 (白紙清空時)，灰色/銀色物體需要底圖才抓得到
-  滑鼠點畫面 + t : 在點的位置點一個點 (用來檢查/校正偏移量)
+  t : 用 i/j/k/l 移動十字選位置，Enter 後在那裡點一個點 (用來檢查/校正偏移量)
 
 執行 (在 mid_project 資料夾)：python main/marker_draw.py
 
@@ -428,37 +428,61 @@ ARUCO_DICT_CANDIDATES = ["DICT_4X4_50", "DICT_5X5_50", "DICT_6X6_50", "DICT_7X7_
                          "DICT_ARUCO_ORIGINAL", "DICT_APRILTAG_36h11"]
 
 
-MAIN_MOUSE = None   # main() 的滑鼠 callback，借用視窗後要換回去
+PICK_STEPS = {ord('1'): 1, ord('2'): 5, ord('3'): 20}   # 十字游標每步幾 px
+
+
+def pick_point(pipeline, win, start, title, marks=(), frame=None, live_overlay=None):
+    """
+    用終端機選畫面上的一個點 (取代滑鼠點選)：
+      i / k / j / l : 十字往 上 / 下 / 左 / 右 (= 轉正後畫面上看到的方向)
+      1 / 2 / 3     : 每步 1 / 5 / 20 px     Enter: 確定     Esc: 取消
+    start = 起始位置 (相機像素)；marks = 要一起畫出來的參考圈；frame = 固定畫面 (None = 即時畫面)
+    回傳 (u, v) 相機像素，取消回傳 None
+    """
+    u, v = float(start[0]), float(start[1])
+    step = 5
+    print(f"  👉 {title}：i/k/j/l 移動十字、1/2/3 步距 1/5/20 px、Enter 確定、Esc 取消 (都在終端機按)")
+    flush_keys()
+    while True:
+        img = (frame if frame is not None else grab(pipeline)).copy()
+        h, w = img.shape[:2]
+        for mu, mv in marks:
+            cv2.circle(img, (int(mu), int(mv)), 10, (0, 255, 0), 2)
+        cv2.drawMarker(img, (int(round(u)), int(round(v))), (0, 0, 255), cv2.MARKER_CROSS, 28, 2)
+        out = to_display(img)
+        put_text(out, f"{title}  ijkl: move  1/2/3: step ({step}px)  Enter: OK  Esc: cancel",
+                 (10, 25), (0, 0, 255), 0.5)
+        if live_overlay:
+            put_text(out, live_overlay(u, v), (10, 470), (0, 255, 0), 0.55)
+        cv2.imshow(win, out)
+        key = poll_key(30)
+        if key in JOG_KEYS:
+            sdx, sdy = JOG_KEYS[key]
+            if DISPLAY_ROTATE_180:            # 畫面轉 180°：顯示方向跟相機像素方向相反
+                sdx, sdy = -sdx, -sdy
+            u = min(max(u + sdx * step, 0), w - 1)
+            v = min(max(v + sdy * step, 0), h - 1)
+        elif key in PICK_STEPS:
+            step = PICK_STEPS[key]
+        elif key in (13, 10):
+            return u, v
+        elif key == 27:
+            return None
 
 
 def click_marker(pipeline, win, pts):
-    """偵測不到的那個 Marker：讓使用者在畫面上點它的中心。回傳 (u, v) 相機像素或 None"""
+    """偵測不到的那個 Marker：用十字游標指出它的中心 (起始位置 = 用另外 3 個推算的第 4 角)"""
+    p = np.array([[u, v] for _, u, v in pts], float)
+    # 3 個角裡距離最遠的兩個是對角線，剩下那個的對角就是缺的那個角 (平行四邊形補點)
+    pairs = [(0, 1), (0, 2), (1, 2)]
+    a, c = max(pairs, key=lambda ij: np.linalg.norm(p[ij[0]] - p[ij[1]]))
+    b = 3 - a - c
+    guess = p[a] + p[c] - p[b]
     frame = grab(pipeline)
-    clicked = {"pt": None}
-
-    def cb(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            clicked["pt"] = flip_pt((x, y), frame.shape)
-    cv2.setMouseCallback(win, cb)
-    print("  👉 在影像視窗點「沒偵測到的那個 Marker」正中心，Enter 確定，Esc 取消")
-    try:
-        while True:
-            out = frame.copy()
-            for _, u, v in pts:
-                cv2.circle(out, (int(u), int(v)), 10, (0, 255, 0), 2)
-            if clicked["pt"]:
-                cv2.drawMarker(out, clicked["pt"], (0, 0, 255), cv2.MARKER_CROSS, 24, 2)
-            out = to_display(out)
-            put_text(out, "Click the MISSING marker center, Enter: OK, Esc: cancel", (10, 25), (0, 0, 255), 0.55)
-            cv2.imshow(win, out)
-            key = cv2.waitKey(30) & 0xFF
-            if key in (13, 10) and clicked["pt"]:
-                return float(clicked["pt"][0]), float(clicked["pt"][1])
-            if key == 27:
-                return None
-    finally:
-        if MAIN_MOUSE:
-            cv2.setMouseCallback(win, MAIN_MOUSE)   # 換回預覽畫面的點選
+    h, w = frame.shape[:2]
+    guess = (min(max(guess[0], 0), w - 1), min(max(guess[1], 0), h - 1))
+    return pick_point(pipeline, win, guess, "MISSING marker center",
+                      marks=[(u, v) for _, u, v in pts], frame=frame)
 
 
 def detect_four(pipeline, win):
@@ -502,6 +526,52 @@ def detect_four(pipeline, win):
     return dict_name, pts
 
 
+try:
+    import msvcrt
+except ImportError:          # 非 Windows：只能用影像視窗按鍵
+    msvcrt = None
+
+
+def flush_keys():
+    """清掉終端機鍵盤緩衝區 (手臂在動時亂按的鍵，不要被下一個步驟讀到)"""
+    while msvcrt and msvcrt.kbhit():
+        msvcrt.getwch()
+
+
+def poll_key(ms=1):
+    """
+    所有按鍵都在「終端機」按就好：
+    一定要呼叫 cv2.waitKey 影像視窗才會更新，所以照呼叫；按鍵優先讀終端機，
+    沒有才用影像視窗的 (焦點不小心在視窗上時也能用)。
+    回傳跟 cv2.waitKey(...) & 0xFF 一樣的碼 (沒按 = 255，Enter = 13，Esc = 27)
+    """
+    win_key = cv2.waitKey(ms) & 0xFF
+    if msvcrt and msvcrt.kbhit():
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):       # 方向鍵等特殊鍵：丟掉
+            msvcrt.getwch()
+            return 255
+        if ch == "\x03":                 # Ctrl+C
+            raise KeyboardInterrupt
+        if ch == "\n":
+            return 13
+        return ord(ch.lower()) & 0xFF
+    return win_key
+
+
+def ask(prompt, choices=None):
+    """
+    input() 前先清掉鍵盤緩衝區：之前亂按的 Enter 會留在緩衝區，下一個 input() 就直接讀到空字串跳過。
+    choices 有給 → 一直問到輸入其中一個為止 (避免殘留按鍵被當成回答)
+    """
+    flush_keys()
+    while True:
+        ans = input(prompt).strip().lower()
+        if choices is None or ans in choices:
+            return ans
+        print(f"  請輸入 {' / '.join(choices)}")
+
+
 def write_calib_json(**fields):
     """更新 CALIB_PATH 裡的欄位 (其他欄位保留)"""
     d = {}
@@ -532,7 +602,7 @@ def save_calibration(taught, dict_name):
     print(f"  4 邊的 mm/px：{', '.join(f'{s:.3f}' for s in sc)}  (舊的平均 {MM_PER_PX:.3f})")
     if (max(sc) - min(sc)) / np.mean(sc) > 0.15:   # 相機有點斜，舊校正本身就差 ~8%
         print("  ⚠️ 4 邊比例差超過 15%，可能有點對歪或順序教錯了，建議重做")
-    if input("  要套用並存檔嗎？(y/n) > ").strip().lower() != "y":
+    if ask("  要套用並存檔嗎？(y/n) > ", ("y", "n")) != "y":
         print("  沒有存")
         return False
     set_calibration(px, am)
@@ -569,10 +639,11 @@ def save_tool_offset(corrections):
         print(f"  {name}: 實際 - 程式算的 = ΔX {dx:+6.2f}, ΔY {dy:+6.2f} mm")
     print(f"  平均 ΔX {mean[0]:+.2f}, ΔY {mean[1]:+.2f} mm，各點跟平均最多差 {spread:.2f} mm")
     if spread > 3.0:
-        print("  ⚠️ 各點偏的不一樣 (> 3 mm)，不只是筆夾歪，校正本身可能有問題，先不要存")
+        print("  ⚠️ 各點偏的不一樣 (> 3 mm)，不只是筆夾歪，校正本身可能有問題，先不要存\n"
+              "     → 紙板 / Marker / 相機動過的話，重跑程式在 [ArUco] 按 c 做完整重新校正")
     new_x, new_y = TOOL_OFFSET_X + mean[0], TOOL_OFFSET_Y + mean[1]
     print(f"  新的筆尖偏移：X={new_x:+.2f}, Y={new_y:+.2f} (原本 {TOOL_OFFSET_X:+.2f}, {TOOL_OFFSET_Y:+.2f})")
-    if input("  要套用並存檔嗎？(y/n) > ").strip().lower() != "y":
+    if ask("  要套用並存檔嗎？(y/n) > ", ("y", "n")) != "y":
         print("  沒有存")
         return
     TOOL_OFFSET_X, TOOL_OFFSET_Y = float(new_x), float(new_y)
@@ -609,14 +680,15 @@ def teach_with_pendant(arm, pipeline, win, targets, recalib=None):
         print(f"  第 {k} 點：畫面{name} 的 Marker [{src}]  ({side})  預估 X={x:.2f}, Y={y:.2f}")
     if recalib:
         print("※ 完整重新校正：預估座標是用舊的對應算的，可能差很多，以畫面上 Marker 的實際位置為準。4 點都要教")
-    print("用示教器把「筆尖」移到 Marker 正中心 (只看 XY，高度隨意)，回到影像視窗按 Enter 記錄")
-    print("  Enter: 記錄   空白: 跳過   Esc: 結束")
+    print("用示教器把「筆尖」移到 Marker 正中心 (只看 XY，高度隨意)，在終端機按 Enter 記錄")
+    print("  (終端機) Enter: 記錄   空白: 跳過   Esc: 結束")
 
     corrections, taught = [], []
     stopped = False
     last_poll, pose = 0.0, None
     for k, (_, name, src, u, v, x, y) in enumerate(items, 1):
         print(f"\n📍 第 {k}/4 點：畫面{name} [{src}]  預估 X={x:.2f}, Y={y:.2f}")
+        flush_keys()                     # 上一點多按的 Enter 不要直接記錄這一點
         while True:
             # 左：Home 拍的參考畫面 (紅圈 = 這次要教的)；右：手臂上的即時畫面
             ref = snapshot.copy()
@@ -641,7 +713,7 @@ def teach_with_pendant(arm, pipeline, win, targets, recalib=None):
                 put_text(live, f"TCP X={pose[0]:.2f} Y={pose[1]:.2f} Z={pose[2]:.2f}", (10, 25), (0, 255, 0), 0.6)
             put_text(live, "Enter: record  Space: skip  Esc: stop", (10, 470), (0, 255, 0))
             cv2.imshow(win, cv2.resize(np.hstack([ref, live]), None, fx=0.75, fy=0.75))
-            key = cv2.waitKey(30) & 0xFF
+            key = poll_key(30)
 
             if key in (13, 10):
                 p = arm.pose()
@@ -666,7 +738,7 @@ def teach_with_pendant(arm, pipeline, win, targets, recalib=None):
             print(f"⚠️ 完整重新校正要 4 點都教 (只教了 {len(taught)} 點)，沒有存")
     elif corrections:
         save_tool_offset(corrections)
-    input("\n教點結束。用示教器把筆抬高、控制器切回遠端/自動模式後按 Enter，手臂會回 Home > ")
+    ask("\n教點結束。用示教器把筆抬高、控制器切回遠端/自動模式後按 Enter，手臂會回 Home > ")
     arm.home()
     time.sleep(1.0)
     return not stopped
@@ -740,7 +812,8 @@ def locate_aruco(arm, pipeline, win):
         arm.move(x, y, Z_TRAVEL)
         arm.move(x, y, z_hover, speed=SPEED_DRAW)
         print("   i/k/j/l: 筆往畫面上/下/左/右   1/2/3: 每步 0.5/2/5 mm   "
-              "Enter: 對準了記錄   空白: 跳過   d: 點一下   Esc: 結束")
+              "(終端機) Enter: 對準了記錄   空白: 跳過   d: 點一下   Esc: 結束")
+        flush_keys()                       # 手臂移過來時多按的鍵不要算
         step = 2.0
         cx, cy = x, y                      # 已送出的目標位置
         pend = [0.0, 0.0]                  # 手臂還在動時按的鍵先累加，停下後一次走完
@@ -781,7 +854,7 @@ def locate_aruco(arm, pipeline, win):
             put_text(live, "ijkl: move  1/2/3: step  Enter: record  Space: skip  d: dot  Esc: stop",
                      (10, 470), (0, 255, 0), 0.45)
             cv2.imshow(win, live)
-            key = cv2.waitKey(1) & 0xFF
+            key = poll_key(1)
 
             if key in JOG_KEYS:
                 ax, ay = screen_dir_to_arm(u, v, *JOG_KEYS[key])
@@ -873,7 +946,7 @@ def render(frame, cnts, sel, path_px, click, status):
         sx, sy = flip_pt(path_px[0], frame.shape)
         put_text(out, "START", (sx + 8, sy - 8), (0, 255, 0))
     put_text(out, status, (10, 470), (0, 255, 0))
-    put_text(out, "n:next s:lock a:aruco c:recalib b:bg click+t:dot q:quit", (10, 20))
+    put_text(out, "(keys in terminal) n:next s:lock a:aruco c:recalib b:bg t:dot q:quit", (10, 20))
     return out
 
 
@@ -888,28 +961,20 @@ def main():
     pipeline.start(cfg)
     win = "Marker Draw"
     cv2.namedWindow(win)
-    click = {"pt": None}   # 存「相機像素」座標
-
-    def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            click["pt"] = flip_pt((x, y), (480, 640))   # 顯示畫面 → 相機像素
-
-    global MAIN_MOUSE
-    MAIN_MOUSE = on_mouse
-    cv2.setMouseCallback(win, on_mouse)
+    click = {"pt": None}   # 上次用 t 點點的位置 (相機像素)，預覽畫面上畫紫色十字
     load_calibration()
 
     try:
         # --- GRIP：直接夾麥克筆 ---
         print("\n[夾筆] 夾爪打開")
         arm.grip(close=False)
-        input("把麥克筆放進夾爪 (筆尖朝下、對正)，放好後按 Enter 夾緊 > ")
+        ask("把麥克筆放進夾爪 (筆尖朝下、對正)，放好後按 Enter 夾緊 > ")
         arm.grip(close=True)
         print("✊ 已夾緊")
 
         # --- 先定位 4 個角的 ArUco ---
-        ans = input("\n[ArUco] Enter: 檢查筆尖偏移   c: 換了 Marker/紙板/相機 → 完整重新校正   "
-                    "x: 跳過 > ").strip().lower()
+        ans = ask("\n[ArUco] Enter: 檢查筆尖偏移   c: 換了 Marker/紙板/相機 → 完整重新校正   "
+                  "x: 跳過 > ", ("", "c", "x"))
         if ans == "c":
             recalibrate(arm, pipeline, win)
         elif ans != "x":
@@ -919,8 +984,11 @@ def main():
             time.sleep(1.0)
 
         bg = load_background()
-        print("\n[預覽] n: 換物體 / s: 鎖定路徑 / a: 檢查筆尖偏移 / c: 完整重新校正 / b: 拍底圖 / "
-              "點畫面+t: 點一個點 / q: 離開")
+        def preview_help():
+            print("\n[預覽] (在終端機按，不用按 Enter) n: 換物體 / s: 鎖定路徑 / a: 檢查筆尖偏移 / "
+                  "c: 完整重新校正 / b: 拍底圖 / t: 選位置點一個點 / q: 離開")
+        preview_help()
+        flush_keys()
         sel = 0
 
         while True:
@@ -933,20 +1001,39 @@ def main():
                       f"length {path_length(path_arm):.0f}mm" if path_arm else "no object")
             cv2.imshow(win, render(frame, cnts, sel, path_px, click["pt"], status))
             cv2.imshow("Object Mask", to_display(mask))
-            key = cv2.waitKey(1) & 0xFF
+            key = poll_key(1)
 
+            if key == 255:
+                continue
             if key == ord('q'):
                 break
             if key == ord('n'):
                 sel += 1
+                print(f"  → 物體 {sel % len(cnts) + 1}/{len(cnts)}" if cnts else "  ⚠️ 沒有偵測到物體")
             elif key == ord('a'):
                 locate_aruco(arm, pipeline, win)
             elif key == ord('c'):
                 recalibrate(arm, pipeline, win)
             elif key == ord('b'):
                 bg = capture_background(pipeline)
-            elif key == ord('t') and click["pt"]:
-                x, y = pixel_to_arm(*click["pt"], OBJ_HEIGHT_MM)
+            elif key == ord('t'):
+                # 起始位置：上次點的地方 → 選中物體的中心 → 畫面中央
+                start = click["pt"]
+                if start is None and cnts:
+                    m = cv2.moments(cnts[sel])
+                    start = (m["m10"] / m["m00"], m["m01"] / m["m00"]) if m["m00"] else None
+                if start is None:
+                    start = (frame.shape[1] / 2, frame.shape[0] / 2)
+                pt = pick_point(pipeline, win, start, "DOT position",
+                                live_overlay=lambda u, v: "arm X=%.2f Y=%.2f" % pixel_to_arm(u, v, OBJ_HEIGHT_MM))
+                if pt is None:
+                    print("  已取消")
+                    flush_keys()
+                    preview_help()
+                    continue
+                click["pt"] = (int(round(pt[0])), int(round(pt[1])))
+                x, y = pixel_to_arm(*pt, OBJ_HEIGHT_MM)
+                print(f"  點點位置 X={x:.2f}, Y={y:.2f}")
                 if path_ok([(x, y)]):
                     dot_at(arm, x, y)
                     arm.home()
@@ -967,19 +1054,26 @@ def main():
                 if not path_ok(path_arm):
                     print("⚠️ 路徑超出工作範圍，不執行")
                     continue
-                cv2.imshow(win, render(frame, cnts, sel, path_px, None, "LOCKED - y: draw / other: cancel"))
-                print("按 y 開始畫，其他鍵取消")
-                if (cv2.waitKey(0) & 0xFF) != ord('y'):
+                cv2.imshow(win, render(frame, cnts, sel, path_px, None, "LOCKED - answer in terminal"))
+                cv2.waitKey(1)
+                if ask("開始畫？(y/n) > ", ("y", "n")) != "y":
                     print("已取消")
+                    preview_help()
                     continue
                 # --- DRAW ---
                 draw_path(arm, path_arm)
                 arm.home()
                 time.sleep(1.0)
                 print("\n✅ 畫完，回到預覽")
+            else:
+                continue
+            # 做完一個動作 (手臂可能動了很久)：期間亂按的鍵丟掉，再印一次按鍵說明
+            if key != ord('n'):
+                flush_keys()
+                preview_help()
 
         arm.home()
-        if input("\n要鬆開夾爪放下麥克筆嗎？(y/n) > ").strip().lower() == "y":
+        if ask("\n要鬆開夾爪放下麥克筆嗎？(y/n) > ", ("y", "n")) == "y":
             arm.grip(close=False)
             print("✋ 已鬆開")
     finally:
