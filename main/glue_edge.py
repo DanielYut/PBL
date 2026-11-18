@@ -300,6 +300,19 @@ OBJ_S_DIFF, OBJ_V_DIFF = 35, 90                                # 顏色模式 (�
 BG_CHROMA_DIFF, BG_BRIGHT_DIFF, BG_DARK_DIFF = 12, 25, 60      # 背景相減模式
 EDGE_LOW, EDGE_HIGH = 25, 70
 
+# --- 多抓到邊 / 雜訊時調這裡 (預覽時也可以在終端機即時調，見 DETECT_KEYS_HELP) ---
+THRESH_SCALE = 1.0      # 上面所有「差多少才算物體」的門檻一起乘這個倍數。
+                        # >1 = 門檻變高、只抓差異明顯的 (陰影/反光/光線變化不會被抓) ；<1 = 更敏感
+                        # ※ 拉高對比的效果 = 門檻變低 → 雜訊也一起變多，所以要少抓邊是「調高」這個
+OPEN_PX = 2             # 侵蝕再膨脹 (開運算) 半徑 px：比 2×OPEN_PX 細的突起 / 細線 / 小雜點會被去掉，
+                        # 大小不變。越大越乾淨，但工件上很細的部分也會被削掉
+CLOSE_PX = 3            # 膨脹再侵蝕 (閉運算) 半徑 px：補起工件邊緣的小缺口 / 小洞
+EDGE_FILL = True        # 背景相減時另外用 Canny「新出現的邊緣」補遮罩 (淺色工件需要)。
+                        # 陰影邊、紙皺、反光容易被當成新邊緣 → 多出邊的話先試關掉 (g)
+EDGE_FILL_MIN_AREA = 150    # Canny 補進來的區塊小於幾 px² 就不要 (零碎的邊線)
+SHADOW_REJECT = True    # Canny 補進來的區塊「只是變暗、顏色沒變」→ 當成陰影丟掉 (h 切換)
+SHADOW_MIN_DARK = 8     # 平均比底圖暗超過幾 (Lab 的 L) 才算陰影
+
 
 def find_paper_mask(hsv):
     S, V = hsv[:, :, 1], hsv[:, :, 2]
@@ -324,28 +337,83 @@ def object_mask(img, bg):
     if paper is None:
         return np.zeros(img.shape[:2], np.uint8)
 
+    k = THRESH_SCALE
     if bg is None:   # 顏色模式：有顏色或很暗
         S, V = hsv[:, :, 1], hsv[:, :, 2]
         ps, pv = np.median(S[paper > 0]), np.median(V[paper > 0])
-        mask = ((S > ps + OBJ_S_DIFF) | (V < pv - OBJ_V_DIFF)).astype(np.uint8) * 255
+        mask = ((S > ps + OBJ_S_DIFF * k) | (V < pv - OBJ_V_DIFF * k)).astype(np.uint8) * 255
     else:            # 背景相減：顏色變、變亮、很暗、或多了清楚邊緣
         a, b = cv2.GaussianBlur(img, (5, 5), 0), cv2.GaussianBlur(bg, (5, 5), 0)
         lab = cv2.cvtColor(a, cv2.COLOR_BGR2LAB).astype(np.float32)
         lab_bg = cv2.cvtColor(b, cv2.COLOR_BGR2LAB).astype(np.float32)
         dL = lab[:, :, 0] - lab_bg[:, :, 0]
         dC = np.hypot(lab[:, :, 1] - lab_bg[:, :, 1], lab[:, :, 2] - lab_bg[:, :, 2])
-        mask = ((dC > BG_CHROMA_DIFF) | (dL > BG_BRIGHT_DIFF) | (dL < -BG_DARK_DIFF)).astype(np.uint8) * 255
-        e = cv2.Canny(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), EDGE_LOW, EDGE_HIGH)
-        eb = cv2.dilate(cv2.Canny(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), EDGE_LOW, EDGE_HIGH), np.ones((5, 5), np.uint8))
-        new_e = cv2.morphologyEx(cv2.bitwise_and(e, cv2.bitwise_not(eb)), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-        cnts, _ = cv2.findContours(new_e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(mask, cnts, -1, 255, -1)
+        mask = ((dC > BG_CHROMA_DIFF * k) | (dL > BG_BRIGHT_DIFF * k) |
+                (dL < -BG_DARK_DIFF * k)).astype(np.uint8) * 255
+        if EDGE_FILL:
+            lo, hi = EDGE_LOW * k, EDGE_HIGH * k
+            e = cv2.Canny(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), lo, hi)
+            eb = cv2.dilate(cv2.Canny(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), lo, hi), np.ones((5, 5), np.uint8))
+            new_e = cv2.morphologyEx(cv2.bitwise_and(e, cv2.bitwise_not(eb)), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+            cnts, _ = cv2.findContours(new_e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            base = mask.copy()                       # 顏色/亮度已經抓到的部分
+            for c in cnts:
+                if cv2.contourArea(c) < EDGE_FILL_MIN_AREA:
+                    continue
+                blob = np.zeros(mask.shape, np.uint8)
+                cv2.drawContours(blob, [c], -1, 255, -1)
+                if SHADOW_REJECT:
+                    # 只看這塊「新加進來」的部分：只是變暗、顏色沒變 → 陰影，不要
+                    extra = (blob > 0) & (base == 0)
+                    if np.count_nonzero(extra) > 20:
+                        if (float(np.mean(dL[extra])) < -SHADOW_MIN_DARK and
+                                float(np.mean(dC[extra])) < BG_CHROMA_DIFF * k):
+                            blob[extra] = 0
+                mask |= blob
 
     mask &= paper
     if ARUCO_EXCLUDE is not None and ARUCO_EXCLUDE.shape == mask.shape:
         mask[ARUCO_EXCLUDE > 0] = 0          # Marker 不算物體
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    if OPEN_PX > 0:      # 侵蝕 → 膨脹：去掉細突起 / 雜點 (圓形核，不會把邊削成方的)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, disk(OPEN_PX))
+    if CLOSE_PX > 0:     # 膨脹 → 侵蝕：補小缺口
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, disk(CLOSE_PX))
+    return mask
+
+
+def disk(r):
+    """半徑 r px 的圓形結構元素"""
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+
+DETECT_KEYS_HELP = ("偵測調整：+/- 門檻 (少抓/多抓)   ]/[ 侵蝕 (去細雜邊) 加/減   "
+                    "}/{ 補洞 加/減   g Canny 補邊 開/關   h 去陰影 開/關   v 印出目前值")
+
+
+def tune_detection(key):
+    """預覽時在終端機即時調偵測參數。回傳 True = 這個鍵是調參數用的"""
+    global THRESH_SCALE, OPEN_PX, CLOSE_PX, EDGE_FILL, SHADOW_REJECT
+    if key == ord('h'):
+        SHADOW_REJECT = not SHADOW_REJECT
+    elif key in (ord('+'), ord('=')):
+        THRESH_SCALE = round(THRESH_SCALE * 1.15, 3)
+    elif key in (ord('-'), ord('_')):
+        THRESH_SCALE = round(max(THRESH_SCALE / 1.15, 0.2), 3)
+    elif key == ord(']'):
+        OPEN_PX += 1
+    elif key == ord('['):
+        OPEN_PX = max(OPEN_PX - 1, 0)
+    elif key == ord('}'):
+        CLOSE_PX += 1
+    elif key == ord('{'):
+        CLOSE_PX = max(CLOSE_PX - 1, 0)
+    elif key == ord('g'):
+        EDGE_FILL = not EDGE_FILL
+    elif key != ord('v'):
+        return False
+    print(f"  🔧 THRESH_SCALE = {THRESH_SCALE}   OPEN_PX = {OPEN_PX}   CLOSE_PX = {CLOSE_PX}   "
+          f"EDGE_FILL = {EDGE_FILL}   SHADOW_REJECT = {SHADOW_REJECT}   (滿意的話把這幾個值填回程式設定區)")
+    return True
 
 
 def detect_objects(img, bg):
@@ -1382,6 +1450,9 @@ def render(frame, cnts, sel, path_px, click, status):
         put_text(out, "START", (sx + 8, sy - 8), (0, 255, 0))
     put_text(out, status, (10, 470), (0, 255, 0))
     put_text(out, "(keys in terminal) n:next s:lock a:aruco c:recalib b:bg t:dot p:snap q:quit", (10, 20))
+    put_text(out, f"thr x{THRESH_SCALE:.2f}  open {OPEN_PX}  close {CLOSE_PX}  "
+                  f"canny {'on' if EDGE_FILL else 'off'}  shadow-cut {'on' if SHADOW_REJECT else 'off'}",
+             (10, 40), (0, 255, 255), 0.45)
     return out
 
 
@@ -1419,6 +1490,7 @@ def main():
         def preview_help():
             print("\n[預覽] (在終端機按，不用按 Enter) n: 換物體 / s: 鎖定路徑 / a: 檢查筆尖偏移 / "
                   "c: 完整重新校正 / b: 拍底圖 / t: 選位置點一個點 / p: 存偵測快照 / q: 離開")
+            print("       " + DETECT_KEYS_HELP)
         preview_help()
         flush_keys()
         sel = 0
@@ -1447,6 +1519,8 @@ def main():
                 continue
             if key == ord('q'):
                 break
+            if tune_detection(key):           # +/- [/] {/} g v：即時調偵測參數
+                continue
             if key == ord('n'):
                 sel += 1
                 h_ema = None
