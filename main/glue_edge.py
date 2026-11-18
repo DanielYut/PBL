@@ -82,6 +82,8 @@ DRAW_SURFACE = "top"        # "top"  : 畫在工件頂面   (Z = Z_PAPER + 量�
 HEIGHT_INNER_ERODE_PX = 8   # 工件內部往內縮幾 px 再量 (邊緣的深度不準)
 HEIGHT_RING_PX = (10, 30)   # 工件外圍第幾 px 到第幾 px 的一圈當作板面
 HEIGHT_MAX_MM = 150.0       # 量到超過這個高度 → 當作量錯
+SIDE_WALL_FIX = True        # 工件不在相機正下方時，輪廓會多包到「側面」→ 依高度和位置算出側面寬度拿掉
+SIDE_WALL_MIN_PX = 1.0      # 算出來的側面寬度小於幾 px 就不處理 (在正下方附近)
 DRAW_OFFSET_PX = -2.0   # 路徑往外 (+) / 往內 (-) 偏幾 px (在影像上沿邊緣法線移，每個邊都一樣)。-2 = 每邊內縮 2 px
 DRAW_OFFSET_MM = 0.0    # 另外再偏幾 mm (在手臂座標沿法線移)，跟上面的 px 會相加。0 = 不用
 
@@ -486,9 +488,65 @@ def measure_height(cnt, obj_mask, depth):
     if len(d_in) < 15 or len(d_ring) < 30:
         return None
     h = float(np.median(d_ring) - np.median(d_in))
+    if SIDE_WALL_FIX and 1.0 < h <= HEIGHT_MAX_MM:
+        # 工件不在正下方時輪廓含側面，側面深度在頂面和板面之間 → 拿掉側面再量一次頂面
+        top = remove_side_wall(cnt, obj_mask.shape, h, "top", depth)
+        if top is not cnt:
+            tf = np.zeros(obj_mask.shape[:2], np.uint8)
+            cv2.drawContours(tf, [top], -1, 255, -1)
+            ti = cv2.erode(tf, ell(HEIGHT_INNER_ERODE_PX))
+            if cv2.countNonZero(ti) < 20:
+                ti = cv2.erode(tf, ell(2))
+            d_top = depth[(ti > 0) & (depth > 0)]
+            if len(d_top) >= 15:
+                h = float(np.median(d_ring) - np.median(d_top))
     if not -5.0 <= h <= HEIGHT_MAX_MM:
         return None
     return max(h, 0.0)
+
+
+def remove_side_wall(cnt, shape, h, keep="top", depth=None):
+    """
+    工件不在相機正下方時，相機會看到朝向畫面中心那一側的「側面」，輪廓 = 頂面 + 側面 (+ 底面)。
+    透視：頂面在畫面上比底面往「遠離畫面中心」的方向偏 d ≈ (位置 - 中心) × h / 相機高度 (px)
+    → 輪廓沿 d 方向做「方向侵蝕」就能拿掉側面：
+        keep="top"  : 留頂面   (點 x 留下 ⇔ x - t·d 都還在輪廓內，t ∈ [0, 1])
+        keep="board": 留底面   (點 x 留下 ⇔ x + t·d 都還在輪廓內) → 沿工件外圍畫在板面上用
+    有深度時先檢查：要拿掉的那條真的是側面 (比頂面深) 才拿；不是就不動 (避免側面沒被抓到時反而削掉頂面)
+    回傳新輪廓；沒有修正時回傳原本的 cnt (同一個物件)
+    """
+    if not SIDE_WALL_FIX or h is None or h <= 0.5:
+        return cnt
+    m = cv2.moments(cnt)
+    if not m["m00"]:
+        return cnt
+    f = h / CAM_HEIGHT_MM
+    dx = (m["m10"] / m["m00"] - CAM_CENTER_PX[0]) * f
+    dy = (m["m01"] / m["m00"] - CAM_CENTER_PX[1]) * f
+    if math.hypot(dx, dy) < SIDE_WALL_MIN_PX:
+        return cnt
+    sil = np.zeros(shape[:2], np.uint8)
+    cv2.drawContours(sil, [cnt], -1, 255, -1)
+
+    def dir_erode(sign):
+        R = int(math.ceil(max(abs(dx), abs(dy)))) + 1
+        ker = np.zeros((2 * R + 1, 2 * R + 1), np.uint8)
+        cv2.line(ker, (R, R), (R + int(round(sign * dx)), R + int(round(sign * dy))), 1, 1)
+        return cv2.erode(sil, ker, anchor=(R, R))
+
+    top = dir_erode(-1)
+    if depth is not None and depth.shape[:2] == sil.shape:
+        strip = (sil > 0) & (top == 0)                        # 要拿掉的那條 (應該是側面)
+        core = cv2.erode(top, disk(3)) > 0
+        ds, dt = depth[strip & (depth > 0)], depth[core & (depth > 0)]
+        if len(ds) > 30 and len(dt) > 30 and float(np.median(ds) - np.median(dt)) < 0.25 * h:
+            return cnt                                         # 那條跟頂面一樣高 → 不是側面，不動
+    out = top if keep == "top" else dir_erode(+1)
+    cs, _ = cv2.findContours(out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cs:
+        return cnt
+    best = max(cs, key=cv2.contourArea)
+    return best if cv2.contourArea(best) > 0.3 * cv2.contourArea(cnt) else cnt
 
 
 def lock_object(pipeline, bg, cnt):
@@ -590,6 +648,11 @@ def make_path(cnt, shape):
     物體邊緣 → (路徑像素點, 路徑手臂點)。沿邊緣等距取點，走一圈回到起點 (+ 重疊段)
     DRAW_OFFSET_MM 用遮罩膨脹/侵蝕做出外擴/內縮
     """
+    # 0. 拿掉透視看到的側面，只留頂面輪廓。畫頂面、畫板面都用頂面：
+    #    工件側面是直的 → 底面 XY = 頂面 XY，而底面邊緣常被頂面擋住看不到，用頂面 + 高度換算最準
+    h = obj_height()
+    cnt = remove_side_wall(cnt, shape, h, "top", LAST_DEPTH if DEPTH_ON else None)
+
     if MASK_BLUR_PX > 0:
         m = np.zeros(shape[:2], np.uint8)
         cv2.drawContours(m, [cnt], -1, 255, -1)
@@ -620,7 +683,7 @@ def make_path(cnt, shape):
         edge = offset_closed(edge, DRAW_OFFSET_PX)
 
     # 3. 每個邊緣點換成手臂座標 (含高度視差修正)
-    arm_all = np.array([pixel_to_arm(u, v, obj_height()) for u, v in edge])
+    arm_all = np.array([pixel_to_arm(u, v, h) for u, v in edge])
 
     # 4. 內縮 / 外擴：在手臂座標 (mm) 沿邊緣法線移，比遮罩侵蝕 (一次至少 1 px ≈ 0.7 mm) 精準
     if DRAW_OFFSET_MM:
