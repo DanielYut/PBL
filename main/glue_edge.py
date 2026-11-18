@@ -313,6 +313,12 @@ EDGE_FILL_MIN_AREA = 150    # Canny 補進來的區塊小於幾 px² 就不要 (
 SHADOW_REJECT = True    # Canny 補進來的區塊「只是變暗、顏色沒變」→ 當成陰影丟掉 (h 切換)
 SHADOW_MIN_DARK = 8     # 平均比底圖暗超過幾 (Lab 的 L) 才算陰影
 
+# --- 自動偵測 (不用手調)：每一張自己量雜訊、自己補曝光 ---
+AUTO_TUNE = True        # True = 門檻跟著「這一張白紙的雜訊」自動調 + 自動補整體亮度/色偏
+AUTO_SIGMA = 5.0        # 門檻至少 = 雜訊標準差的幾倍 (5 ≈ 雜訊幾乎不會超過)。上面的固定門檻當下限
+STABLE_FRAMES = 5       # 預覽時最近幾張投票：一個像素要在過半張數都被抓到才算 (去掉一閃一閃的邊)。1 = 不投票
+NOISE = {}              # 最近一張量到的雜訊 / 實際用的門檻 (顯示用)
+
 
 def find_paper_mask(hsv):
     S, V = hsv[:, :, 1], hsv[:, :, 2]
@@ -347,9 +353,28 @@ def object_mask(img, bg):
         lab = cv2.cvtColor(a, cv2.COLOR_BGR2LAB).astype(np.float32)
         lab_bg = cv2.cvtColor(b, cv2.COLOR_BGR2LAB).astype(np.float32)
         dL = lab[:, :, 0] - lab_bg[:, :, 0]
-        dC = np.hypot(lab[:, :, 1] - lab_bg[:, :, 1], lab[:, :, 2] - lab_bg[:, :, 2])
-        mask = ((dC > BG_CHROMA_DIFF * k) | (dL > BG_BRIGHT_DIFF * k) |
-                (dL < -BG_DARK_DIFF * k)).astype(np.uint8) * 255
+        da = lab[:, :, 1] - lab_bg[:, :, 1]
+        db = lab[:, :, 2] - lab_bg[:, :, 2]
+        thr_c, thr_b, thr_d = BG_CHROMA_DIFF * k, BG_BRIGHT_DIFF * k, BG_DARK_DIFF * k
+        ref = paper[::4, ::4] > 0                     # 白紙區 (隔 4 點取樣，算比較快)
+        if AUTO_TUNE and np.count_nonzero(ref) > 500:
+            # 1. 曝光 / 白平衡補償：整張紙一起變亮變暗、偏色 → 扣掉 (工件只佔一小塊，中位數不受影響)
+            dL -= np.median(dL[::4, ::4][ref])
+            da -= np.median(da[::4, ::4][ref])
+            db -= np.median(db[::4, ::4][ref])
+        dC = np.hypot(da, db)
+        if AUTO_TUNE and np.count_nonzero(ref) > 500:
+            # 2. 量這一張白紙的雜訊 (MAD → 標準差，工件不影響)，門檻至少 AUTO_SIGMA 倍雜訊
+            sL = 1.4826 * float(np.median(np.abs(dL[::4, ::4][ref])))
+            cs = dC[::4, ::4][ref]
+            cm = float(np.median(cs))
+            sC = 1.4826 * float(np.median(np.abs(cs - cm)))
+            thr_b = max(thr_b, AUTO_SIGMA * sL)
+            thr_d = max(thr_d, AUTO_SIGMA * sL)
+            thr_c = max(thr_c, cm + AUTO_SIGMA * sC)
+            NOISE.update(sL=sL, sC=sC)
+        NOISE.update(chroma=thr_c, bright=thr_b, dark=thr_d)
+        mask = ((dC > thr_c) | (dL > thr_b) | (dL < -thr_d)).astype(np.uint8) * 255
         if EDGE_FILL:
             lo, hi = EDGE_LOW * k, EDGE_HIGH * k
             e = cv2.Canny(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), lo, hi)
@@ -367,7 +392,7 @@ def object_mask(img, bg):
                     extra = (blob > 0) & (base == 0)
                     if np.count_nonzero(extra) > 20:
                         if (float(np.mean(dL[extra])) < -SHADOW_MIN_DARK and
-                                float(np.mean(dC[extra])) < BG_CHROMA_DIFF * k):
+                                float(np.mean(dC[extra])) < thr_c):
                             blob[extra] = 0
                 mask |= blob
 
@@ -416,9 +441,22 @@ def tune_detection(key):
     return True
 
 
-def detect_objects(img, bg):
-    """回傳 (物體輪廓 list (由大到小), 物體遮罩)"""
+_VOTE = {"key": None, "masks": []}
+
+
+def detect_objects(img, bg, stable=False):
+    """
+    回傳 (物體輪廓 list (由大到小), 物體遮罩)
+    stable=True (預覽用)：最近 STABLE_FRAMES 張遮罩投票，過半張數都有的像素才算物體
+    """
     mask = object_mask(img, bg)
+    if stable and STABLE_FRAMES > 1:
+        key = (id(bg), mask.shape)                # 換底圖 / 解析度 → 重新投票
+        if _VOTE["key"] != key:
+            _VOTE["key"], _VOTE["masks"] = key, []
+        _VOTE["masks"] = (_VOTE["masks"] + [mask > 0])[-STABLE_FRAMES:]
+        votes = np.sum(_VOTE["masks"], axis=0)
+        mask = (votes * 2 > len(_VOTE["masks"])).astype(np.uint8) * 255
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     cnts = [c for c in cnts if MIN_AREA < cv2.contourArea(c) < MAX_AREA]
     return sorted(cnts, key=cv2.contourArea, reverse=True), mask
@@ -1450,9 +1488,11 @@ def render(frame, cnts, sel, path_px, click, status):
         put_text(out, "START", (sx + 8, sy - 8), (0, 255, 0))
     put_text(out, status, (10, 470), (0, 255, 0))
     put_text(out, "(keys in terminal) n:next s:lock a:aruco c:recalib b:bg t:dot p:snap q:quit", (10, 20))
-    put_text(out, f"thr x{THRESH_SCALE:.2f}  open {OPEN_PX}  close {CLOSE_PX}  "
-                  f"canny {'on' if EDGE_FILL else 'off'}  shadow-cut {'on' if SHADOW_REJECT else 'off'}",
-             (10, 40), (0, 255, 255), 0.45)
+    auto = (f"auto noise L{NOISE['sL']:.1f} C{NOISE['sC']:.1f} -> thr C{NOISE['chroma']:.0f} "
+            f"B{NOISE['bright']:.0f} D{NOISE['dark']:.0f}  " if AUTO_TUNE and "sL" in NOISE else "")
+    put_text(out, auto + f"x{THRESH_SCALE:.2f} open {OPEN_PX} close {CLOSE_PX} "
+                  f"canny {'on' if EDGE_FILL else 'off'} shadow {'on' if SHADOW_REJECT else 'off'}",
+             (10, 40), (0, 255, 255), 0.4)
     return out
 
 
@@ -1499,7 +1539,7 @@ def main():
         while True:
             # --- DETECT ---
             frame = grab(pipeline)
-            cnts, mask = detect_objects(frame, bg)
+            cnts, mask = detect_objects(frame, bg, stable=True)
             sel = sel % len(cnts) if cnts else 0
             if DEPTH_ON and cnts:
                 h = measure_height(cnts[sel], mask, LAST_DEPTH)
