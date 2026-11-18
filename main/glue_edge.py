@@ -82,10 +82,22 @@ DRAW_SURFACE = "top"        # "top"  : 畫在工件頂面   (Z = Z_PAPER + 量�
 HEIGHT_INNER_ERODE_PX = 8   # 工件內部往內縮幾 px 再量 (邊緣的深度不準)
 HEIGHT_RING_PX = (10, 30)   # 工件外圍第幾 px 到第幾 px 的一圈當作板面
 HEIGHT_MAX_MM = 150.0       # 量到超過這個高度 → 當作量錯
-DRAW_OFFSET_PX = -2.0   # 路徑往外 (+) / 往內 (-) 偏幾 px (在影像上沿邊緣法線移，每個邊都一樣)。-2 = 每邊內縮 2 px
+DRAW_OFFSET_PX = 0.0    # 路徑往外 (+) / 往內 (-) 偏幾 px (在影像上沿邊緣法線移，每個邊都一樣)。-2 = 每邊內縮 2 px；0 = 不內縮
 DRAW_OFFSET_MM = 0.0    # 另外再偏幾 mm (在手臂座標沿法線移)，跟上面的 px 會相加。0 = 不用
 
-# --- 塗膠路徑 (沿邊緣，不簡化成特徵點) ---
+# --- 路徑方式 ---
+PATH_MODE = "vertex"        # "vertex": 偵測工件頂點，頂點之間拉直線 (每個邊一段，速度穩定、轉角是尖的)
+                            #           不是多邊形 (圓、大圓角) → 自動改用 "edge"
+                            # "edge"  : 沿邊緣走 (曲線照實際形狀，下面的「塗膠路徑」設定)
+VERTEX_EPS_PX = 4.0         # 找頂點時輪廓簡化的容許誤差 (px)：越大頂點越少
+VERTEX_MIN_TURN_DEG = 25.0  # 轉彎小於幾度的點不算頂點 (幾乎直線)
+VERTEX_MIN_SIDE_PX = 12.0   # 兩個頂點距離小於幾 px → 合併 (尖角被裁鈍會變成兩個很近的點)
+VERTEX_TRIM_RATIO = 0.15   # 擬合每條邊時，頭尾各去掉多少比例的點 (轉角在影像上是圓的)
+VERTEX_FIT_TOL_PX = 3.0     # 輪廓 95% 的點離多邊形要在幾 px 內，否則不是多邊形 → 改用 edge (邊緣粗糙就調大)
+VERTEX_MAX_SHIFT_PX = 15.0  # 擬合出的頂點離原本的角超過幾 px → 擬合失敗 → 改用 edge
+VERTEX_MAX = 12             # 頂點超過幾個 → 當作曲線 → 改用 edge
+
+# --- 塗膠路徑 (沿邊緣，PATH_MODE = "edge" 或不是多邊形時) ---
 GLUE_STEP_MM = 3.0      # 沿邊緣每隔幾 mm 取一點 (每一點 = 一小段 MovL)。越小越貼邊、越多停頓
 SMOOTH_PX = 7           # 邊緣平滑：前後幾個像素取平均，去掉像素鋸齒 (1 = 不平滑；要奇數)
 MASK_BLUR_PX = 2.0      # 取邊緣前先把工件遮罩模糊 (σ px) 再二值化，磨掉階梯 / 小凸起 (0 = 不做；越大尖角越圓)
@@ -385,6 +397,24 @@ def measure_height(cnt, obj_mask, depth):
     return max(h, 0.0)
 
 
+def imwrite_u(path, img):
+    """cv2.imwrite 遇到中文路徑會默默失敗 → 先編碼再用 numpy 寫檔"""
+    ok, buf = cv2.imencode(os.path.splitext(path)[1] or ".png", img)
+    if ok:
+        buf.tofile(path)
+    else:
+        print(f"⚠️ 存檔失敗 {path}")
+    return ok
+
+
+def imread_u(path):
+    """cv2.imread 遇到中文路徑會回傳 None → 用 numpy 讀再解碼"""
+    try:
+        return cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR)
+    except OSError:
+        return None
+
+
 def lock_object(pipeline, bg, cnt):
     """
     按 s 鎖定時連拍 LOCK_FRAMES 張，找同一個工件：
@@ -438,16 +468,16 @@ def save_debug(frame, mask, cnts, sel, path_px, bg):
     os.makedirs(DEBUG_DIR, exist_ok=True)
     tag = time.strftime("%Y%m%d_%H%M%S")
     base = os.path.join(DEBUG_DIR, tag)
-    cv2.imwrite(base + "_frame.png", frame)
-    cv2.imwrite(base + "_mask.png", mask)
+    imwrite_u(base + "_frame.png", frame)
+    imwrite_u(base + "_mask.png", mask)
     ov = frame.copy()
     for i, c in enumerate(cnts):
         cv2.drawContours(ov, [c], -1, (0, 255, 255) if i != sel else (0, 0, 255), 1)
     if len(path_px) > 1:
         cv2.polylines(ov, [np.int32(path_px)], False, (255, 0, 0), 1)
-    cv2.imwrite(base + "_overlay.png", ov)
+    imwrite_u(base + "_overlay.png", ov)
     if bg is not None:
-        cv2.imwrite(base + "_bg.png", bg)
+        imwrite_u(base + "_bg.png", bg)
     if LAST_DEPTH is not None:
         np.save(base + "_depth.npy", LAST_DEPTH)
     print(f"💾 已存偵測快照 {base}_*.png  (模式：{'背景相減' if bg is not None else '顏色'})")
@@ -459,7 +489,7 @@ def save_debug(frame, mask, cnts, sel, path_px, bg):
 
 def load_background():
     if os.path.exists(BG_PATH):
-        bg = cv2.imread(BG_PATH)
+        bg = imread_u(BG_PATH)
         if bg is not None:
             print(f"📂 已載入底圖 {BG_PATH}")
             return bg
@@ -471,7 +501,7 @@ def capture_background(pipeline, n=15):
     acc = sum(grab(pipeline).astype(np.float32) for _ in range(n))
     bg = (acc / n).astype(np.uint8)
     os.makedirs(os.path.dirname(BG_PATH), exist_ok=True)
-    cv2.imwrite(BG_PATH, bg)
+    imwrite_u(BG_PATH, bg)
     print(f"📷 已拍底圖 {BG_PATH}")
     return bg
 
@@ -479,10 +509,150 @@ def capture_background(pipeline, n=15):
 # ==========================================
 # 5. 邊緣 → 畫線路徑
 # ==========================================
+LAST_PATH_MODE = ""   # 上一次 make_path 實際用的方式 ("vertex" / "edge")，畫面顯示用
+
+
 def make_path(cnt, shape):
     """
+    物體邊緣 → (路徑像素點, 路徑手臂點)
+    PATH_MODE = "vertex"：偵測頂點，頂點之間拉直線 (不是多邊形 → 自動改用沿邊緣)
+    PATH_MODE = "edge"  ：沿邊緣走
+    """
+    global LAST_PATH_MODE
+    if PATH_MODE == "vertex":
+        r = make_path_vertex(cnt, shape)
+        if r is not None:
+            LAST_PATH_MODE = "vertex"
+            return r
+    LAST_PATH_MODE = "edge"
+    return make_path_edge(cnt, shape)
+
+
+def _line_intersect(l1, l2):
+    """兩條直線 (點 p, 方向 d) 的交點；幾乎平行回傳 None"""
+    (p1, d1), (p2, d2) = l1, l2
+    den = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(den) < 1e-6:
+        return None
+    t = ((p2[0] - p1[0]) * d2[1] - (p2[1] - p1[1]) * d2[0]) / den
+    return p1 + t * d1
+
+
+def find_vertices(cnt):
+    """
+    工件輪廓 → 頂點 (px，浮點數，順著輪廓方向)。不是多邊形回傳 None
+      1. approxPolyDP 找大概的頂點，拿掉幾乎沒轉彎的
+      2. 每個邊：拿兩個頂點中間的輪廓點 (頭尾各去掉一段，轉角在影像上是圓的) 擬合直線
+      3. 相鄰兩條直線的交點 = 頂點 (亞像素、轉角是尖的)
+      4. 檢查：整條輪廓離這個多邊形都不能太遠，否則不是多邊形 (例如圓、大圓角)
+    回傳 (頂點 Nx2, 每條邊的直線 [(點, 單位方向)], 逆時針?)
+    """
+    pts = cnt.reshape(-1, 2).astype(np.float64)
+    n = len(pts)
+    if n < 20:
+        return None
+    approx = cv2.approxPolyDP(cnt, VERTEX_EPS_PX, True).reshape(-1, 2)
+    # approxPolyDP 的點都是輪廓上的點 → 找回 index
+    idx = sorted({int(np.argmin(np.hypot(*(pts - a).T))) for a in approx})
+
+    # 拿掉轉角太小 (幾乎直線) 的頂點、合併太近的頂點 (尖角在影像上被裁鈍，會被拆成兩個點)，直到穩定
+    changed = True
+    while changed and len(idx) > 3:
+        changed = False
+        for k in range(len(idx)):
+            a, b, c = pts[idx[k - 1]], pts[idx[k]], pts[idx[(k + 1) % len(idx)]]
+            v1, v2 = b - a, c - b
+            ang = abs(math.degrees(math.atan2(v1[0] * v2[1] - v1[1] * v2[0], v1 @ v2)))
+            if ang < VERTEX_MIN_TURN_DEG or np.hypot(*v2) < VERTEX_MIN_SIDE_PX:
+                idx.pop(k)          # 太近的兩點留一個就好，真正的頂點由兩側長邊的直線交點求出
+                changed = True
+                break
+    m = len(idx)
+    if m < 3 or m > VERTEX_MAX:
+        return None
+
+    # 每條邊擬合直線
+    lines = []
+    for k in range(m):
+        i0, i1 = idx[k], idx[(k + 1) % m]
+        seg = pts[i0:i1 + 1] if i1 > i0 else np.vstack([pts[i0:], pts[:i1 + 1]])
+        trim = max(3, int(len(seg) * VERTEX_TRIM_RATIO))
+        core = seg[trim:-trim] if len(seg) > 2 * trim + 5 else seg
+        if len(core) < 5:
+            return None
+        vx, vy, x0, y0 = cv2.fitLine(np.float32(core), cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+        d = np.array([vx, vy], float)
+        if d @ (seg[-1] - seg[0]) < 0:                    # fitLine 的方向是任意的 → 統一成沿輪廓走的方向
+            d = -d
+        lines.append((np.array([x0, y0], float), d))
+
+    verts = []
+    for k in range(m):
+        v = _line_intersect(lines[k - 1], lines[k])       # 第 k-1 邊和第 k 邊的交點 = 第 k 個頂點
+        if v is None:
+            return None
+        verts.append(v)
+    verts = np.array(verts)
+
+    # 交點不能跑離原本的頂點太遠 (擬合失敗)
+    if np.max(np.hypot(*(verts - pts[idx]).T)) > VERTEX_MAX_SHIFT_PX:
+        return None
+    # 整條輪廓離多邊形的距離：95% 的點都要在 VERTEX_FIT_TOL_PX 內
+    poly = np.float32(verts).reshape(-1, 1, 2)
+    d = np.abs([cv2.pointPolygonTest(poly, (float(x), float(y)), True) for x, y in pts])
+    if np.percentile(d, 95) > VERTEX_FIT_TOL_PX:
+        return None
+    area = 0.5 * np.sum(verts[:, 0] * np.roll(verts[:, 1], -1) - np.roll(verts[:, 0], -1) * verts[:, 1])
+    return verts, lines, area > 0
+
+
+def make_path_vertex(cnt, shape):
+    """
+    頂點路徑：每個邊一段 MovL (一條邊從頭到尾速度穩定)，回到起點後沿第一條邊多走 GLUE_OVERLAP_MM
+    內縮：每條邊的直線往內平移 DRAW_OFFSET_PX (+ DRAW_OFFSET_MM 換成 px)，再重新求交點 → 轉角保持尖的
+    不是多邊形回傳 None
+    """
+    r = find_vertices(cnt)
+    if r is None:
+        return None
+    verts, lines, ccw = r
+    off = DRAW_OFFSET_PX + DRAW_OFFSET_MM / MM_PER_PX         # + 往外 / - 往內 (px)
+    if off:
+        moved = []
+        for p, d in lines:
+            nrm = np.array([d[1], -d[0]])                     # 逆時針時是往外
+            if not ccw:
+                nrm = -nrm
+            moved.append((p + off * nrm, d))
+        new = [_line_intersect(moved[k - 1], moved[k]) for k in range(len(moved))]
+        if any(v is None for v in new):
+            return None
+        verts = np.array(new)
+        # 內縮太多 (邊縮到沒了 / 翻轉) → 不做
+        a2 = 0.5 * np.sum(verts[:, 0] * np.roll(verts[:, 1], -1) - np.roll(verts[:, 0], -1) * verts[:, 1])
+        if (a2 > 0) != ccw:
+            return None
+
+    h = obj_height()
+    arm_v = np.array([pixel_to_arm(u, v, h) for u, v in verts])
+    pts_px = [tuple(v) for v in verts] + [tuple(verts[0])]
+    pts_arm = [tuple(a) for a in arm_v] + [tuple(arm_v[0])]
+    # 重疊段：回到起點後沿第一條邊再走 GLUE_OVERLAP_MM (不超過第一條邊長)
+    if GLUE_OVERLAP_MM > 0:
+        e = arm_v[1] - arm_v[0]
+        L = float(np.hypot(*e))
+        if L > 1e-6:
+            t = min(GLUE_OVERLAP_MM, L) / L
+            pts_arm.append(tuple(arm_v[0] + t * e))
+            pts_px.append(tuple(verts[0] + t * (verts[1] - verts[0])))
+    px = [(int(round(u)), int(round(v))) for u, v in pts_px]
+    arm = [(float(x), float(y)) for x, y in pts_arm]
+    return px, arm
+
+
+def make_path_edge(cnt, shape):
+    """
     物體邊緣 → (路徑像素點, 路徑手臂點)。沿邊緣等距取點，走一圈回到起點 (+ 重疊段)
-    DRAW_OFFSET_MM 用遮罩膨脹/侵蝕做出外擴/內縮
     """
     if MASK_BLUR_PX > 0:
         m = np.zeros(shape[:2], np.uint8)
@@ -1368,7 +1538,7 @@ def render(frame, cnts, sel, path_px, click, status):
         cv2.drawContours(out, [c], -1, (0, 255, 255) if i != sel else (0, 0, 255), 1)
     if len(path_px) > 1:
         cv2.polylines(out, [np.int32(path_px)], False, (255, 0, 0), 2)   # 塗膠路徑
-        for p in path_px[::5]:
+        for p in (path_px if len(path_px) <= 30 else path_px[::5]):   # 點少 (頂點路徑) → 每點都標
             cv2.circle(out, p, 2, (255, 255, 0), -1)          # 每 5 點標一下，看取點密度
         cv2.circle(out, path_px[0], 6, (0, 255, 0), -1)       # 起點
     if click:
@@ -1435,7 +1605,7 @@ def main():
                     h_ema = h if h_ema is None else 0.7 * h_ema + 0.3 * h
                 CUR_HEIGHT = h_ema
             path_px, path_arm = make_path(cnts[sel], frame.shape) if cnts else ([], [])
-            status = (f"object {sel + 1}/{len(cnts)}  segments {max(len(path_arm) - 1, 0)}  "
+            status = (f"object {sel + 1}/{len(cnts)}  [{LAST_PATH_MODE}] segments {max(len(path_arm) - 1, 0)}  "
                       f"length {path_length(path_arm):.0f}mm" if path_arm else "no object")
             if DEPTH_ON and cnts:
                 status += f"  height {CUR_HEIGHT:.1f}mm" if CUR_HEIGHT is not None else "  height ?"
@@ -1511,8 +1681,16 @@ def main():
                 cnts[sel] = lock_cnt
                 xs, ys = [p[0] for p in path_arm], [p[1] for p in path_arm]
                 print(f"\n========== 塗膠路徑 ==========")
-                print(f"  {len(path_arm) - 1} 小段，總長 {path_length(path_arm):.0f} mm，"
-                      f"每段約 {GLUE_STEP_MM} mm (含頭尾重疊 {GLUE_OVERLAP_MM} mm)")
+                if LAST_PATH_MODE == "vertex":
+                    nv = len(path_arm) - (2 if GLUE_OVERLAP_MM > 0 else 1)
+                    print(f"  頂點路徑：{nv} 個頂點，{len(path_arm) - 1} 段 (每個邊一段 + 重疊 {GLUE_OVERLAP_MM} mm)，"
+                          f"總長 {path_length(path_arm):.0f} mm")
+                    for i, (x, y) in enumerate(path_arm[:nv], 1):
+                        print(f"    頂點 {i}: X={x:.2f}, Y={y:.2f}")
+                else:
+                    if PATH_MODE == "vertex":
+                        print("  ⚠️ 這個工件不是多邊形 (圓 / 大圓角)，改用沿邊緣走")
+                    print(f"  {len(path_arm) - 1} 小段，總長 {path_length(path_arm):.0f} mm (含頭尾重疊 {GLUE_OVERLAP_MM} mm)")
                 print(f"  起點 X={xs[0]:.2f}, Y={ys[0]:.2f}")
                 print(f"  範圍 X {min(xs):.2f} ~ {max(xs):.2f}，Y {min(ys):.2f} ~ {max(ys):.2f}")
                 print(f"  塗膠高度 Z={draw_z() - PEN_PRESS_MM:.3f} (紙面 {Z_PAPER:.3f} + 物體高度 "
