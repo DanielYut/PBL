@@ -4,3 +4,8 @@ __pycache__/
 .vscode/
 data/debug/
 data/background.png
+rl/uploader/build/
+rl/dist/
+/build/
+RLUploader.spec
+delta_smooth/

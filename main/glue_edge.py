@@ -103,10 +103,10 @@ SMOOTH_PX = 7           # 邊緣平滑：前後幾個像素取平均，去掉像
 MASK_BLUR_PX = 2.0      # 取邊緣前先把工件遮罩模糊 (σ px) 再二值化，磨掉階梯 / 小凸起 (0 = 不做；越大尖角越圓)
 LOCK_FRAMES = 15        # 按 s 鎖定時連拍幾張：遮罩平均 (去邊緣雜訊) + 高度取中位數
 USE_RL_PATH = True      # True = 塗膠交給控制器的 RL 程式 (rl/pbl_path.lua) 用 MovL + PASS 連續走，不會每段停
-RL_SPEED_TRAVEL = 10    # RL 模式移動速度 (%)。注意：RL 的 % 跟 Modbus GO 的 % 不一定一樣，先用小的試
-RL_SPEED_GLUE = 5       # RL 模式塗膠速度 (%)
+RL_SPEED_TRAVEL = 30    # RL 模式移動速度 (%)。注意：RL 的 % 跟 Modbus GO 的 % 不一定一樣 (原本 10)
+RL_SPEED_GLUE = 15      # RL 模式塗膠速度 (%)。越快 DEC 模式轉角切得越內側 (原本 5)
 RL_OVERLAP_MM = 3.0     # 曲線 (edge 模式) 每個點提早幾 mm 轉彎，連成平順曲線
-RL_CORNER_OVERLAP_MM = 0.0  # 多邊形 (vertex 模式) 的轉角：0 = 尖角 (到角才轉)，>= 1 = 轉角磨圓不停頓
+RL_CORNER_OVERLAP_MM = 3.0  # 多邊形 (vertex 模式) 的轉角：0 = 尖角 (到角才轉)，>= 1 = 轉角磨圓不停頓
 GLUE_OVERLAP_MM = 5.0   # 走完一圈回到起點後再多走幾 mm，讓膠線頭尾接起來 (0 = 不重疊)
 SPEED_GLUE = SPEED_DRAW # 塗膠速度 (%)
 GLUE_PAUSE_S = 0.0      # 每段走到點之後額外停幾秒 (0 = 一到位馬上走下一段，最流暢)
@@ -878,7 +878,9 @@ def build_rl_points(pts, z_draw, z_up):
     n = len(pts)
     for i in range(1, n):
         ovl = 0.0
-        if i < n - 1 and corner > 0:                                       # 最後一點要到位 (接著抬筆)
+        if i < n - 1 and corner > 0 and rl_path.PASS_MODE == rl_path.PASS_DEC:
+            ovl = 1.0                                                      # DEC 模式：只當「要 PASS」的旗標
+        elif i < n - 1 and corner > 0:                                     # 最後一點要到位 (接著抬筆)
             a, b, c = pts[i - 1], pts[i], pts[i + 1]
             shortest = min(math.hypot(b[0] - a[0], b[1] - a[1]), math.hypot(c[0] - b[0], c[1] - b[1]))
             ovl = min(corner, 0.45 * shortest)
