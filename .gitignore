@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .venv/
 .vscode/
+data/debug/
+data/background.png

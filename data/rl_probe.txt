@@ -1,0 +1,13 @@
+P type=table keys=[1,2,3,4,5,6,7,8,9,10,...]
+P[1]={Active=1 c=4016 b=-16537 y=0 x=453868 UF=0 Elbow=0 TF=0 PS=0 Coord=1 z=709551 a=178855 Flip=0 JntRotCnt={1=0 2=0 3=0 4=0 5=0 6=0 7=0 8=3} Shoulder=0}
+Point(): ok=true r1={}
+Point(13 args): ok=true r1={y=400 x=t1 z=0}
+Point(1): ok=true r1={x=1}
+ReadPoint(P[1],X): ok=false r1=__temp__\MS.lua:1982: attempt to call field '?' (a nil value)
+pose X/Y/Z/A/B/C=357.2335,-29.756875,729.7544375,-179.262703125,1.1833138427734,-105.2361796875
+RX/RY/RZ=-179.262625,1.1833138427734,-105.23625
+Elbow/Shoulder/Flip=0,0,0 JRC={1=0 2=0 3=0 4=0 5=0 6=0 7=0 8=0}
+UF=false TF=false
+xRL keys=[getpoint]
+motion keys=[MovPR_C,GetCommandPosition,AutoAcc,FigureAngleComp,GetPassInfo,SetDecJ,MArchP_C,SpdJ,DecJ,TorqueLimitOn,GetJointVelocity,MotionStop_Axis_C,SetJeckJ,SetCollisionProtectPara,GetFeedbackPosition,GetBufferMode,GetDecJ,MovP,GravityCompensationPara,SetGravityPayload,MArcDir_C,SetOverlapDistance,SetHome,GetJointTorque,ExtSetHome,MArchL_C,InsertCommand,JerkL,PassMode,MArc_C,InPosition,AccL,MovJ,ThermalCompensation,ContinueLineJOG_C,TorqueLimitOff,WaitBuffer,GetAccJ,GetTorqueLimitSwitch,GetJointAccel,...]
+fun keys=[MultiTask,JerkL]
