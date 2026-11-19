@@ -1,6 +1,8 @@
 -- ============================================================
 -- PBL 連續路徑執行器 (台達 DRV，MS2 機器人語言)
--- 放在 DRAStudio Pro 專案的 main.lua，由 Python (main/rl_path.py) 透過 Modbus 觸發。
+-- 平常不用下載這個檔：控制器上裝的是 rl/loader.lua (只裝一次)，
+-- main/rl_path.py 每次啟動 RL 時會把這個檔透過 Modbus 送進去執行。改完直接跑 Python 就生效。
+-- (也可以像以前一樣直接放進 DRAStudio 專案的 main.lua，一樣能用)
 --
 -- 為什麼需要它：Modbus 的 GO 指令 (0x0300 = 301/302) 一次只能送一個點，每段都會停；
 -- RL 程式裡的 MovL + PASS() 可以讓控制器在轉角處提早轉彎，整條路徑連續不停。
@@ -12,6 +14,8 @@
 --   0x1002  版本號 (RL 啟動後寫入，Python 用來確認 RL 已經在跑)
 --   0x1003  目前執行到第幾點
 --   0x1004  RX、RY、RZ (各 2 word，0.001 度)
+--   0x100A  PASS 模式：0 = DISTANT (轉角磨圓，每段仍加減速)，1 = DEC (速度疊合，連續不減速)
+--   0x100B  DEC 模式的疊合 % (1~100，100 = 前段減速和下段加速完全重疊)
 --   0x1010  自我測試回傳區：第 1 點 X、Y、Z，RL 讀到的目前位置 X、Y、Z (各 2 word，0.001 mm)
 --   0x1020  起每點 10 word：X、Y、Z (各 2 word，0.001 mm)、速度 %、種類 (0 = MovL，1 = MovP)、
 --           轉角混合距離 (0.1 mm，0 = 到位才走下一段)、保留 (最多到 0x1EFE，約 380 點)
@@ -21,7 +25,7 @@
 local BASE = 0x1000
 local PTS = 0x1020
 local REC = 10
-local VER = 1
+local VER = 3   -- 2：加 PASS DEC 模式 (0x100A/0x100B)；3：改由 loader.lua 載入
 
 local function u16(v)
     if v < 0 then v = v + 65536 end
@@ -114,25 +118,77 @@ local function readOri()
     return s32(o[1], o[2]) / 1000, s32(o[3], o[4]) / 1000, s32(o[5], o[6]) / 1000
 end
 
+local STAGE = ""   -- 目前執行到哪一步，出錯時一起回報
+
+-- MovL/MovP 不吃自己組的點位表 (MovP_C 會 attempt to index a nil value)。
+-- 改用台達官方範例的做法：點位表編號。CopyPoint(新編號, 1) 拿 P1 的 UF/TF/姿態當模板，
+-- WritePoint 改座標 (mm / 度)，再 MovL(編號)。P1 本身不會被改。
+-- 每個點用自己的編號 (SLOT0 + i)，PASS 預先規劃下一段時不會被覆蓋。
+local SLOT0 = 500                  -- 編號 500 起當暫存點，點位表這段不要放自己教的點
+local function setSlot(id, x, y, z, a, b, c)
+    CopyPoint(id, 1)
+    WritePoint(id, "X", x)
+    WritePoint(id, "Y", y)
+    WritePoint(id, "Z", z)
+    WritePoint(id, "RX", a)
+    WritePoint(id, "RY", b)
+    WritePoint(id, "RZ", c)
+end
+
 local function runPath()
+    STAGE = "read N"
     local n = u16(ReadModbus(BASE + 1, "W"))
+    STAGE = "readOri"
     local rx, ry, rz = readOri()
-    PassMode("DISTANT", 100)
+    -- 先把所有點寫進點位表 (手臂還沒動)。動起來之後迴圈裡只剩 MovL，
+    -- 下一段指令才來得及在 PASS 轉彎區之前送出，否則每點都會減速
+    local recs = {}
     for i = 1, n do
+        STAGE = "readRec " .. i
         local x, y, z, spd, kind, ovl = readRec(i)
-        WriteModbus(BASE + 3, "W", i)
         if spd < 1 then spd = 5 end
-        local p = makePoint(x, y, z, rx, ry, rz)
+        STAGE = "setSlot " .. i
+        local p = SLOT0 + i
+        setSlot(p, x, y, z, rx, ry, rz)
+        local bx, by, bz = ReadPoint(p, "X"), ReadPoint(p, "Y"), ReadPoint(p, "Z")
+        if math.abs(bx - x) > 0.05 or math.abs(by - y) > 0.05 or math.abs(bz - z) > 0.05 then
+            error("point " .. i .. " write mismatch: want " .. x .. "," .. y .. "," .. z
+                  .. " got " .. tostring(bx) .. "," .. tostring(by) .. "," .. tostring(bz))
+        end
+        recs[i] = {p, spd, kind, ovl}
+    end
+    -- 0x100A = PASS 模式 (0 = DISTANT 距離疊合，1 = DEC 速度疊合)，0x100B = DEC 的疊合 %
+    -- 手冊 1.7：DISTANT 每段還是會加減速 (只是轉角磨圓)；DEC 100% = 前段減速和下段加速完全重疊，速度接得起來
+    STAGE = "PassMode"
+    local dec = u16(ReadModbus(BASE + 10, "W")) == 1
+    if dec then
+        local t = u16(ReadModbus(BASE + 11, "W"))
+        if t < 1 or t > 100 then t = 100 end
+        PassMode("DEC", 100)
+        SetOverlapTime(t)
+    else
+        PassMode("DISTANT", 100)
+    end
+    for i = 1, n do
+        local p, spd, kind, ovl = recs[i][1], recs[i][2], recs[i][3], recs[i][4]
+        WriteModbus(BASE + 3, "W", i)
         if kind == 1 then
+            STAGE = "MovP " .. i
             MovP(p, SPD(spd))
         elseif ovl > 0 and i < n then
-            if ovl < 1 then ovl = 1 end
-            SetOverlapDistance(ovl)
+            if not dec then
+                if ovl < 1 then ovl = 1 end
+                STAGE = "SetOverlapDistance " .. i
+                SetOverlapDistance(ovl)
+            end
+            STAGE = "MovL+PASS " .. i
             MovL(p, SPD(spd) + PASS())
         else
+            STAGE = "MovL " .. i
             MovL(p, SPD(spd))
         end
     end
+    STAGE = "done"
 end
 
 local function field(c, k, i)
@@ -255,11 +311,54 @@ local function probe()
     report(string.sub(PROBE, page * 250 + 1, page * 250 + 250))
 end
 
+-- 原地測試各種 MovL/MovP 寫法 (目標 = 目前位置，手臂不會移動)，回報哪些可以用
+local function moveTest()
+    local x, y, z = RobotX(), RobotY(), RobotZ()
+    local a, b, c = RobotRX(), RobotRY(), RobotRZ()
+    local id = SLOT0
+    local s = "pos " .. string.format("%.2f,%.2f,%.2f", x, y, z)
+    local ok, err = pcall(setSlot, id, x, y, z, a, b, c)
+    s = s .. " | setSlot:" .. (ok and "ok" or tostring(err))
+    if not ok then report(s) return end
+    -- 讀回來確認單位是 mm/度 而且真的寫進去了，否則不准動 (避免點位跑到奇怪的地方)
+    local back = {ReadPoint(id, "X"), ReadPoint(id, "Y"), ReadPoint(id, "Z")}
+    s = s .. " back=" .. tostring(back[1]) .. "," .. tostring(back[2]) .. "," .. tostring(back[3])
+    for k, v in ipairs({x, y, z}) do
+        if type(back[k]) ~= "number" or math.abs(back[k] - v) > 0.05 then
+            report(s .. " | MISMATCH, no move")
+            return
+        end
+    end
+    local tests = {
+        {"MovL(id)",               function() MovL(id) end},
+        {"MovL(id,SPD)",           function() MovL(id, SPD(5)) end},
+        {"MovL(id,SPD+PASS)",      function() MovL(id, SPD(5) + PASS()) end},
+        {"MovL(id,SPD,PASS)",      function() MovL(id, SPD(5), PASS()) end},
+        {"MovL(id,'PASS')",        function() MovL(id, "PASS") end},
+        {"MovP(id,SPD)",           function() MovP(id, SPD(5)) end},
+        {"MovL(id) end",           function() MovL(id) end},
+    }
+    for k, t in ipairs(tests) do
+        local ok2, e2 = pcall(t[2])
+        s = s .. " | " .. k .. ":" .. (ok2 and "ok" or string.sub(tostring(e2), -22))
+    end
+    report(s)
+end
+
+local function traceback(e)
+    if debug ~= nil and debug.traceback ~= nil then
+        return debug.traceback(tostring(e), 2)
+    end
+    return tostring(e)
+end
+
 local function try(fn, name)
-    local ok, err = pcall(fn)
+    STAGE = ""
+    local ok, err = xpcall(fn, traceback)
     if not ok then
-        print(name .. " error: " .. tostring(err))
-        pcall(report, name .. " error: " .. tostring(err))
+        local msg = name .. " error @" .. STAGE .. ": " .. tostring(err)
+        print(msg)
+        pcall(report, msg)
     end
     return ok
 end
@@ -286,6 +385,12 @@ while true do
     elseif cmd == 11 then
         if try(probe, "probe") then
             WriteModbus(BASE, "W", 12)
+        else
+            WriteModbus(BASE, "W", 9)
+        end
+    elseif cmd == 13 then
+        if try(moveTest, "moveTest") then
+            WriteModbus(BASE, "W", 14)
         else
             WriteModbus(BASE, "W", 9)
         end
