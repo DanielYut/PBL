@@ -1,31 +1,33 @@
 # 智慧化焊道／塗膠路徑產生（第一組 PBL 專題）
 
-用相機拍攝工件，自動辨識工件邊緣或接縫，產生焊道／塗膠路徑，再交給台達六軸手臂執行。目標是取代人工逐點示教：換工件、換擺放位置時，不必重新教點。
+用相機拍工件，自動找出工件邊緣並產生塗膠路徑，再交給台達六軸手臂（DRV）**連續不停頓**地走完。這個專題要取代人工逐點示教：換工件、換擺放位置時，不必重新教點。
 
-> 目前用「夾麥克筆沿物體邊緣畫線」模擬焊槍／膠槍。兩支程式：
-> - [main/marker_draw.py](main/marker_draw.py)：輪廓簡化成特徵點（方塊只剩 4 個角），角跟角之間拉直線。
-> - [main/glue_edge.py](main/glue_edge.py)：沿偵測到的邊緣連續走（塗膠），曲線、圓角都照實際形狀走。
+> 目前用夾爪夾麥克筆沿工件邊緣畫線，模擬膠槍。
 
 ## 資料夾內容
 
 ```
 mid_project/
 ├── main/
-│   ├── marker_draw.py   # 夾麥克筆，沿物體邊緣的特徵點畫線（單一檔案，不依賴其他檔案）
-│   ├── glue_edge.py     # 夾麥克筆模擬塗膠，沿物體邊緣連續走（單一檔案，不依賴其他檔案）
-│   ├── send.py          # 手臂控制函式庫：Go_Position、gripper_ON/OFF 等
-│   └── request.py       # 讀取手臂狀態（send.py 會用到）
+│   ├── glue_edge.py    # 主程式：相機 → 偵測工件 → 量高度 → 產生路徑 → 手臂塗膠
+│   └── rl_path.py      # 把路徑交給控制器的 RL 程式連續走（glue_edge 會自動呼叫；也可單獨測試）
+├── rl/
+│   ├── loader.lua      # 控制器上的載入器（用 DRAStudio 裝一次）
+│   └── pbl_path.lua    # 控制器上實際走路徑的 Lua，rl_path.py 每次會透過 Modbus 自動送進控制器
 ├── data/
-│   ├── aruco_xy_calib.json      # ArUco 4 點 XY 校正 + 筆尖偏移（兩支程式共用，校正後自動存）
-│   ├── marker_tool_offset.json  # 舊 Marker 的校正紀錄（程式已不再讀取）
-│   └── background.png           # 底圖（程式裡按 b 拍）
+│   ├── aruco_xy_calib.json   # ArUco 4 點 XY 校正 + 筆尖偏移（校正後自動存）
+│   ├── background.png        # 底圖（程式裡按 b 拍）
+│   ├── rl_globals.txt        # 控制器 Lua 有哪些函式（rl_path.py names 的輸出，查資料用）
+│   └── rl_probe.txt          # 控制器點位格式（rl_path.py probe 的輸出，查資料用）
 ├── requirements.txt
 └── README.md
 ```
 
-## 環境與執行
+## 環境
 
-需要 Python 3.8 ~ 3.12（pyrealsense2 不一定支援更新的版本）、Intel RealSense 相機（USB 3.0），以及和電腦在同一個網段的台達 DRV 手臂。
+- Python 3.8 ~ 3.12（pyrealsense2 不一定支援更新的版本）
+- Intel RealSense 相機（USB 3.0）
+- 台達 DRV 手臂 + DCV 控制器，電腦跟控制器在同一個網段（控制器 `192.168.1.1`，電腦設 `192.168.1.x`）
 
 ```bash
 python -m venv .venv
@@ -33,80 +35,114 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-> pymodbus 必須是 3.6.x。新版（3.7 以後）拿掉了 `send.py`／`request.py` 用到的 `pymodbus.payload`，也改了函式參數寫法，裝新版會直接出錯。
+## 第一次設定控制器（只做一次）
 
-在 `mid_project` 資料夾執行：
+塗膠時，路徑不是用 Modbus 一個點一個點送，而是交給控制器上的 RL（Lua）程式用 `MovL + PASS()` 連續走完，詳見下方「[連續路徑原理](#連續路徑原理)」。控制器上要先裝好載入器：
+
+1. 用 DRAStudio 開一個 RL 專案（RL ID **1**），把 [rl/loader.lua](rl/loader.lua) 的內容整段貼進 `main.lua`，然後下載到控制器。
+2. 點位表的 **P1** 一定要存在。新的路徑點會沿用 P1 的座標系（UF/TF）和手臂姿態，請用平常的工作姿態教。
+3. 點位表 **501 號以後**會被當成暫存點覆蓋，不要放教點。
+4. 控制器切到 **Auto 模式**，然後 Servo ON。
+
+裝好後，**改 `pbl_path.lua` 不用再開 DRAStudio**：每次塗膠時 Python 會把最新版送進控制器。換電腦也不用裝 DRAStudio。
+
+確認方法（手臂不會動）：
 
 ```bash
-python main/marker_draw.py    # 特徵點畫線
-python main/glue_edge.py      # 沿邊緣連續塗膠
+cd main
+python rl_path.py test
 ```
 
-## 麥克筆畫邊緣（marker_draw.py）
+看到 `已送出 pbl_path.lua`、`RL 已啟動` 和 `✅ 自我測試通過`，就代表設定好了。
 
-第一次執行前，先檢查檔案開頭「1. 設定」區塊：
+## 執行
 
-- `ARM_IP`、`UNIT_ID`：手臂控制器的 IP 和 Unit ID。
-- `X_HOME` … `RZ_HOME`：拍照位置。改了就要重新做 ArUco 定位。
-- `OBJ_HEIGHT_MM`：畫在物體頂面填物體高度，畫在紙上（物體周圍）填 0。
-- `Z_PAPER`、`Z_MIN`：筆尖碰到紙面的 Z，以及安全下限。高度只用程式裡的值，校正不會改 Z。
+```bash
+cd main
+python glue_edge.py
+```
 
-流程：
+第一次執行前，先檢查 [glue_edge.py](main/glue_edge.py) 開頭「1. 設定」區塊：
+
+| 參數 | 說明 |
+|---|---|
+| `ARM_IP`、`UNIT_ID` | 控制器 IP 和 Modbus Unit ID |
+| `X_HOME` … `RZ_HOME` | 拍照位置。改了就要重新做 ArUco 校正 |
+| `Z_PAPER` | 筆尖碰到板面時的 Z（用示教器量一次，板子不動就不用改） |
+| `Z_MIN` | 安全下限，低於這個高度不准移動 |
+| `DRAW_SURFACE` | `"top"` = 畫在工件頂面；`"board"` = 畫在板面、沿工件外圍 |
+| `AUTO_HEIGHT` | `True` = 用深度相機自動量工件高度；`False` = 用 `OBJ_HEIGHT_MM` |
+
+### 流程
 
 | 階段 | 說明 |
 |---|---|
-| GRIP | 夾爪打開 → 把麥克筆放進夾爪（筆尖朝下）→ 按 Enter 夾緊 |
-| ARUCO | 程式詢問要做哪一種：<br>**Enter** 檢查筆尖偏移：用示教器讓筆尖對準 4 個角的 ArUco 中心，算出平均偏移<br>**c** 完整重新校正（換了 Marker／紙板／相機時用）：重新偵測 4 個 Marker，用示教器讓筆尖對準每個中心，重建像素→手臂的 XY 對應<br>**x** 跳過<br>結果都存到 `data/aruco_xy_calib.json`，下次自動載入 |
+| GRIP | 把麥克筆放進夾爪（筆尖朝下），程式送出夾緊 |
+| ARUCO | **Enter**：檢查筆尖偏移，用示教器讓筆尖依序對準 4 個角的 ArUco 中心<br>**c**：完整重新校正（換了 Marker／紙板／相機時用）<br>**x**：跳過<br>結果存到 `data/aruco_xy_calib.json`，下次自動載入 |
 | HOME | 回拍照位置 |
-| DETECT | 預覽畫面偵測白紙上的物體，藍線是邊緣路徑（畫面轉 180° 跟實際方向一致） |
-| CONFIRM | 終端機印出路徑點，按 `y` 開始畫，其他鍵取消 |
-| DRAW | 到第 1 點上方 → 下筆 → 沿邊緣直線移動一圈 → 抬筆 → 回 HOME |
+| DETECT | 預覽畫面偵測工件，藍線是路徑，同時用深度量工件高度 |
+| CONFIRM | 終端機印出路徑和塗膠高度，按 `y` 開始，其他鍵取消 |
+| GLUE | RL 連續路徑：移到起點上方 → 下筆 → 沿邊緣走一圈（回到起點再多走 `GLUE_OVERLAP_MM`）→ 抬筆 |
+| HOME | 回拍照位置，回到 DETECT |
 
-DETECT 畫面的按鍵：
+### DETECT 的按鍵（都在**終端機**按，不用按 Enter）
 
 | 按鍵 | 功能 |
 |---|---|
 | `n` | 換下一個物體 |
-| `s` | 鎖定路徑，進入 CONFIRM |
+| `s` | 鎖定路徑，進入 CONFIRM（連拍 `LOCK_FRAMES` 張平均，去雜訊） |
 | `a` | 檢查筆尖偏移 |
-| `c` | 完整重新校正（換了 Marker／紙板／相機） |
-| `b` | 拍底圖（白紙清空時拍）。灰色／銀色物體需要底圖才抓得到 |
-| 滑鼠點畫面 + `t` | 在點的位置點一個點，用來檢查偏移量 |
+| `c` | 完整重新校正 |
+| `b` | 拍底圖（板面清空時拍）。灰色／銀色物體需要底圖才抓得到 |
+| `t` | 用 `i`/`j`/`k`/`l` 移動十字，Enter 後在那裡點一個點（檢查偏移量用） |
+| `p` | 存偵測快照到 `data/debug/` |
 | `q` | 結束，會問要不要鬆開夾爪 |
 
-> 畫線時手臂會移動到紙面高度。操作時手要放在教導器的緊急停止鈕旁邊，第一次先確認 `Z_PAPER` 和 `Z_MIN` 正確。
+> ⚠️ 塗膠時手臂會下到工件表面。操作時手要放在教導器的緊急停止鈕旁邊，第一次先確認 `Z_PAPER` 和 `Z_MIN` 正確。
 
-完整重新校正時，如果某個 Marker 偵測不到，程式會讓你在畫面上點它的中心。程式會自動試好幾種 ArUco 字典。
+### 路徑方式（`PATH_MODE`）
 
-## 沿邊緣塗膠（glue_edge.py）
+- **`"vertex"`（預設）**：找出工件頂點，頂點之間拉直線，每個邊一段。轉角用 `RL_CORNER_OVERLAP_MM` 磨圓，不停頓（設成 0 = 尖角、到角才轉）。工件不是多邊形（圓形、大圓角）時，會自動改用 edge。
+- **`"edge"`**：沿邊緣每隔 `GLUE_STEP_MM` 取一點，曲線照實際形狀走。
 
-從 `marker_draw.py` 複製出來，校正、按鍵、流程都一樣，差在路徑和移動方式：
-
-- **路徑**：使用邊緣上每一個像素 → 平滑 → 每隔 `GLUE_STEP_MM` 取一點。直的地方合成一段，彎的地方點照樣密。
-- **頭尾接合**：走完一圈回到起點後，再多走 `GLUE_OVERLAP_MM`，讓膠線接起來。
-- **減少停頓**：一到位馬上送下一段。快到終點時會提前送下一段；控制器若不接受，程式偵測到後會自動關閉這個功能。塗完會印出統計。
-
-可調參數（檔案開頭「塗膠路徑」區塊）：
+### 塗膠相關參數
 
 | 參數 | 預設 | 說明 |
 |---|---|---|
-| `GLUE_STEP_MM` | 3.0 | 每段多長，越小越貼邊、停頓越多 |
-| `SMOOTH_PX` | 7 | 邊緣平滑程度（像素，奇數） |
-| `GLUE_MERGE_TOL_MM` | 0.3 | 直的地方合併的容許誤差，0 = 不合併 |
+| `USE_RL_PATH` | `True` | 用控制器 RL 連續走。`False`（或 RL 啟動失敗）時，改用 Modbus 逐段 MovL，每段會停 |
+| `RL_SPEED_GLUE` | 15 | 塗膠速度 %。越快膠線越細、轉角切得越往內側 |
+| `RL_SPEED_TRAVEL` | 30 | 移到起點、抬筆時的速度 % |
+| `RL_CORNER_OVERLAP_MM` | 3.0 | vertex 模式的轉角處理，0 = 尖角 |
+| `GLUE_STEP_MM` | 3.0 | edge 模式的點距 |
 | `GLUE_OVERLAP_MM` | 5.0 | 頭尾重疊長度，0 = 不重疊 |
-| `GLUE_EARLY_MM` | 1.0 | 離終點多少 mm 就提前送下一段，0 = 關閉。越大越順、轉角切得越多 |
-| `GLUE_PAUSE_S` | 0.0 | 每段之間額外停頓秒數 |
-| `SPEED_GLUE` | 同 `SPEED_DRAW` | 塗膠速度（%） |
+| `DRAW_OFFSET_PX` / `DRAW_OFFSET_MM` | 0 | 路徑往外（+）／往內（−）偏移 |
 
-> 每段之間仍可能有很短的停頓：控制器在移動中可能忽略新指令。要完全連續，需要用示教器的「連續」功能（要查台達 DRAStudio 的 Modbus Address 對照表，尚未實作）。
+PASS 疊合方式在 [rl_path.py](main/rl_path.py) 開頭設定：`PASS_MODE = PASS_DEC`、`OVERLAP_TIME = 100`。轉角偏離邊緣太多時，可以把 `OVERLAP_TIME` 降到 50～70。
 
-## 手臂控制函式庫
+## rl_path.py 單獨測試
 
-[main/send.py](main/send.py) 和 [main/request.py](main/request.py) 用 Modbus TCP 控制手臂，要在 `main/` 裡 import（`send.py` 用 `import request`）：
+都在 `main/` 資料夾執行：
 
-- `send.Go_Position(c, x, y, z, rx, ry, rz, speed, mov)`：移動到指定點位，`mov` 可選 `send.MovP`（點對點）或 `send.MovL`（直線，適合走焊道）。
-- `send.gripper_ON(c)`／`send.gripper_OFF(c)`：夾爪夾緊／打開。
-- `request.Get_TCP_Pose(c)`：讀取手臂目前的 TCP 座標。
+| 指令 | 手臂 | 說明 |
+|---|---|---|
+| `python rl_path.py diag` | 不動 | 讀控制器狀態（模式、RL 狀態、錯誤代碼），一步步試啟動 RL |
+| `python rl_path.py test` | 不動 | 送 Lua + 自我測試 |
+| `python rl_path.py movetest` | 原地 | 在目前位置試各種 MovL/MovP 寫法 |
+| `python rl_path.py nudge` | 動 | 往上移 10 mm（確認座標系） |
+| `python rl_path.py square` | 動 | 在目前高度畫 30 mm 方形 |
+| `python rl_path.py circle` | 動 | 在目前高度畫半徑 20 mm 圓形 |
+| `python rl_path.py names` / `probe` | 不動 | 列出控制器 Lua 的函式／點位格式，存到 `data/` |
+
+## 連續路徑原理
+
+- **為什麼不用 Modbus 直接送點**：Modbus GO 指令（0x0300 = 301/302）一次只能走一個點，到點會減速停下；手臂在移動時，控制器也會忽略新指令。所以每段之間一定會頓一下。
+- **交給 RL 程式走**：Python 把整條路徑寫進控制器的 Device Buffer（0x1020 起），控制器上的 Lua 讀出來，用 `MovL(點, SPD(%) + PASS())` 連續送。
+- **`PassMode("DEC")` + `SetOverlapTime(100)`**：前一段的減速和下一段的加速完全重疊，速度接得起來。預設的 DISTANT 模式只是在點附近磨圓，每段仍會加減速，點很密時還是會頓（MS2 RL 手冊 1.7 節）。
+- **點要用點位表編號**：控制器的 `MovL`／`MovP` 不接受 Lua 自己組的點位表。所以先 `CopyPoint(500+i, 1)` 複製 P1，再用 `WritePoint` 改座標。出發前會先把所有點寫好，動起來之後迴圈裡只剩 `MovL`，下一段才來得及接上。
+- **Lua 透過 Modbus 傳送**：`loader.lua` 收到 Python 送來的原始碼（每個暫存器放 2 個位元組）後，用 `load()` 執行。所以改 Lua 不用開 DRAStudio。
+- **走完一定要停掉 RL**：RL 在執行時，控制器不接受 Modbus GO 指令，所以 `rl_path.py` 走完會自動停止 RL，之後回 Home 等動作才能照常執行。
+
+> 這套連續路徑另外整理成通用套件 **DeltaArm_Smooth**（私人 repo，不含相機和塗膠），給其他組使用。
 
 ## 專題目標
 
@@ -118,19 +154,19 @@ DETECT 畫面的按鍵：
 ## 系統流程
 
 ```
-相機擷取影像 → 邊緣／接縫辨識 → 像素座標轉手臂座標
-           → 路徑點產生 → IKM 計算與撞機檢查 → 手臂沿路徑作業
+相機擷取影像 → 邊緣辨識 + 深度量高度 → 像素座標轉手臂座標
+           → 路徑點產生 → 控制器 RL 連續路徑 → 手臂沿路徑作業
 ```
 
 | 模組 | 項目 | 說明 |
 |---|---|---|
 | 1 感知模組 | 1-1 相機架設與內參校正 | 固定相機高度，校正鏡頭內參與畸變 |
-| | 1-2 座標轉換 | 建立影像座標與手臂座標的轉換（目前用 4 個 ArUco 標記定位） |
-| | 1-3 邊緣辨識 | 找出工件輪廓或接縫 |
-| 2 路徑規劃模組 | 2-1 路徑點產生 | 沿輪廓取樣出手臂可執行的路徑點 |
+| | 1-2 座標轉換 | 建立影像座標與手臂座標的轉換（用 4 個 ArUco 標記定位） |
+| | 1-3 邊緣辨識 | 找出工件輪廓，深度相機量工件高度 |
+| 2 路徑規劃模組 | 2-1 路徑點產生 | 頂點路徑／沿邊路徑 |
 | | 2-2 焊接品質 | 評估路徑與作業結果（評估標準待定義） |
 | 3 手臂控制 | 3-1 IKM 計算與撞機檢查 | 用逆向運動學檢查奇異點與碰撞 |
-| | 3-2 實機操作 | 透過 Modbus TCP 控制手臂執行路徑 |
+| | 3-2 實機操作 | Modbus TCP + 控制器 RL 程式連續執行路徑 |
 
 ## 團隊分工
 
@@ -164,7 +200,7 @@ P：全責　A：協助、參與　C：諮詢　S：確認核可
 |---|---|---|
 | 奇異點無解 | 手臂無法依規劃路徑作業 | 限制工作範圍，確保手臂能到達所需姿態 |
 | 路徑生成誤差或缺漏 | 路徑偏差或缺少路徑點 | 固定相機高度、確保光線充足，並確認相機與手臂座標轉換一致 |
-| 手臂與工件碰撞 | 作業中撞到工件 | 將加工分為四段，每完成一段就回到安全點 |
+| 手臂與工件碰撞 | 作業中撞到工件 | `Z_MIN` 安全下限、移動前先抬到 `Z_TRAVEL`；路徑點寫入控制器後會讀回比對 |
 
 ## 待確認事項
 

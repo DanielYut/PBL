@@ -1,5 +1,5 @@
 # Python 3.8 - 3.12
-# pymodbus must be 3.6.x: main/send.py and main/request.py use pymodbus.payload and positional slave args, removed in 3.7+
+# pymodbus 3.6.x: main/glue_edge.py passes the slave id positionally; newer releases changed these signatures (only 3.6.9 is tested)
 pymodbus==3.6.9
 pyrealsense2
 opencv-python
