@@ -62,7 +62,7 @@ RX_HOME, RY_HOME, RZ_HOME = -179.260, 1.185, -105.234
 # --- 高度 (TCP 的 Z) ---
 Z_DRAW = None           # 筆尖剛好碰到要畫的表面時的 Z。None = 自動用 Z_PAPER + OBJ_HEIGHT_MM
                         # (想直接指定就填數字，例如用示教器量到的物體頂面 Z)
-PEN_PRESS_MM = 0      # 筆尖剛好碰到表面，不再往下壓 (要壓的話填正數 mm)
+PEN_PRESS_MM = -2       # 筆尖剛好碰到表面，不再往下壓 (要壓的話填正數 mm)
 Z_LIFT = 15.0           # 抬筆高度 (畫之前/之後停在表面上方幾 mm)
 Z_TRAVEL = 560.000      # 從 Home 過去 / 回來的安全高度
 Z_MIN = 395.0           # 安全下限，低於這個高度不准移動
@@ -81,6 +81,9 @@ DRAW_SURFACE = "top"        # "top"  : 畫在工件頂面   (Z = Z_PAPER + 量�
 HEIGHT_INNER_ERODE_PX = 8   # 工件內部往內縮幾 px 再量 (邊緣的深度不準)
 HEIGHT_RING_PX = (10, 30)   # 工件外圍第幾 px 到第幾 px 的一圈當作板面
 HEIGHT_MAX_MM = 150.0       # 量到超過這個高度 → 當作量錯
+SIDE_WALL_FIX = True        # 工件不在相機正下方時，輪廓會多包到「側面」→ 依高度和每個點的位置算透視，只留頂面
+SIDE_WALL_MIN_PX = 1.0      # 最寬的側面小於幾 px (640x480 基準) 就不處理 (工件在正下方附近)
+SIDE_WALL_DEPTH_RATIO = 0.2  # 要拿掉的那條要比頂面深「高度 × 這個比例」以上才算側面，否則不動
 DRAW_OFFSET_PX = 0.0    # 路徑往外 (+) / 往內 (-) 偏幾 px (在影像上沿邊緣法線移，每個邊都一樣)。-2 = 每邊內縮 2 px；0 = 不內縮
 DRAW_OFFSET_MM = 0.0    # 另外再偏幾 mm (在手臂座標沿法線移)，跟上面的 px 會相加。0 = 不用
 
@@ -122,6 +125,7 @@ TOOL_OFFSET_X = 0.0
 TOOL_OFFSET_Y = 0.0
 
 # --- 顯示 ---
+DISPLAY_SCALE = 0.5         # 監控視窗縮放 (1280x720 → 640x360)；只影響顯示，偵測 / 計算都用原解析度
 DISPLAY_ROTATE_180 = True   # 相機畫面跟實際看到的上下左右相反 → 轉 180° 顯示 (只影響顯示，不影響計算)
 
 # --- ArUco 定位 (畫之前先讓筆尖到 4 個角的 Marker 中心，確認位置準不準) ---
@@ -258,8 +262,16 @@ PTS_ARM = np.float32([[653.210, 75.842], [647.689, -209.430], [403.074, -211.327
 H_MATRIX, _ = cv2.findHomography(PTS_PIXEL, PTS_ARM)
 CALIB_PATH = os.path.join(DATA_DIR, "aruco_xy_calib.json")   # 新 Marker 的 XY 校正 + 筆尖偏移
 
+# --- 相機解析度 ---
+# 改解析度後：校正 (aruco_xy_calib.json 的像素座標) 要重做、底圖要重拍 (程式啟動時會提示)。
+# 程式裡以 px 為單位的參數都是用 640x480 調的，開相機時會依焦距 fx 自動等比例放大 (見 apply_px_scale)
+CAM_W, CAM_H = 1280, 720         # 彩色
+DEPTH_W, DEPTH_H = 848, 480      # 深度 (848x480 是 D435 深度最準的解析度；會對齊到彩色，所以深度圖 = 彩色大小)
+FX_REF = 615.0                   # 640x480 彩色的焦距 fx (px)，px 參數就是在這個解析度下調的
+PX_SCALE = 1.0                   # 目前 fx / FX_REF，開相機後設定
+
 # 高度視差：物體頂面比紙面高、離相機近，看起來會往外擴。以相機正下方為中心縮回。
-CAM_CENTER_PX = (318.7, 246.8)   # 相機光軸在畫面上的位置 (RealSense 640x480 內參)
+CAM_CENTER_PX = (318.7, 246.8)   # 相機光軸在畫面上的位置 (開相機後由內參 ppx, ppy 覆蓋)
 CAM_HEIGHT_MM = 445.0            # 相機到紙面距離 (由 Marker 大小估算)
 
 
@@ -289,15 +301,19 @@ def set_calibration(pts_pixel, pts_arm):
     MM_PER_PX = float(np.mean(side_scales(PTS_PIXEL, PTS_ARM)))
 
 
+CALIB_SIZE = (640, 480)   # 校正 (PTS_PIXEL) 是在哪個解析度做的；跟相機不一樣 → 像素座標要重抓
+
+
 def load_calibration():
     """讀 data/aruco_xy_calib.json：4 點 XY 對應 + 筆尖偏移 (Z 不從檔案讀，用程式裡的 Z_PAPER / Z_DRAW)"""
     global ARUCO_DICT
     if not os.path.exists(CALIB_PATH):
         print("📐 Marker 對應用程式裡寫死的值 (還沒做過完整重新校正)")
         return
-    global TOOL_OFFSET_X, TOOL_OFFSET_Y
+    global TOOL_OFFSET_X, TOOL_OFFSET_Y, CALIB_SIZE
     with open(CALIB_PATH, encoding="utf-8") as fp:
         d = json.load(fp)
+    CALIB_SIZE = tuple(d.get("image_size", (640, 480)))   # 舊檔沒記錄 = 當時都是 640x480
     if d.get("pts_pixel") and d.get("pts_arm"):
         set_calibration(d["pts_pixel"], d["pts_arm"])
         print(f"📐 已載入 Marker XY 對應 {CALIB_PATH} ({d['saved_at']}, {d.get('aruco_dict', '')})")
@@ -324,7 +340,7 @@ def find_paper_mask(hsv):
         return None
     v_thr, _ = cv2.threshold(V[low_sat].reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     white = (low_sat & (V > v_thr)).astype(np.uint8) * 255
-    white = cv2.morphologyEx(white, cv2.MORPH_OPEN, np.ones((15, 15), np.uint8))
+    white = cv2.morphologyEx(white, cv2.MORPH_OPEN, np.ones((kpx(15), kpx(15)), np.uint8))
     cnts, _ = cv2.findContours(white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
@@ -345,23 +361,26 @@ def object_mask(img, bg):
         ps, pv = np.median(S[paper > 0]), np.median(V[paper > 0])
         mask = ((S > ps + OBJ_S_DIFF) | (V < pv - OBJ_V_DIFF)).astype(np.uint8) * 255
     else:            # 背景相減：顏色變、變亮、很暗、或多了清楚邊緣
-        a, b = cv2.GaussianBlur(img, (5, 5), 0), cv2.GaussianBlur(bg, (5, 5), 0)
+        gk = (kpx(5), kpx(5))
+        a, b = cv2.GaussianBlur(img, gk, 0), cv2.GaussianBlur(bg, gk, 0)
         lab = cv2.cvtColor(a, cv2.COLOR_BGR2LAB).astype(np.float32)
         lab_bg = cv2.cvtColor(b, cv2.COLOR_BGR2LAB).astype(np.float32)
         dL = lab[:, :, 0] - lab_bg[:, :, 0]
         dC = np.hypot(lab[:, :, 1] - lab_bg[:, :, 1], lab[:, :, 2] - lab_bg[:, :, 2])
         mask = ((dC > BG_CHROMA_DIFF) | (dL > BG_BRIGHT_DIFF) | (dL < -BG_DARK_DIFF)).astype(np.uint8) * 255
         e = cv2.Canny(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), EDGE_LOW, EDGE_HIGH)
-        eb = cv2.dilate(cv2.Canny(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), EDGE_LOW, EDGE_HIGH), np.ones((5, 5), np.uint8))
-        new_e = cv2.morphologyEx(cv2.bitwise_and(e, cv2.bitwise_not(eb)), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        eb = cv2.dilate(cv2.Canny(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), EDGE_LOW, EDGE_HIGH),
+                        np.ones((kpx(5), kpx(5)), np.uint8))
+        new_e = cv2.morphologyEx(cv2.bitwise_and(e, cv2.bitwise_not(eb)), cv2.MORPH_CLOSE,
+                                 np.ones((kpx(7), kpx(7)), np.uint8))
         cnts, _ = cv2.findContours(new_e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(mask, cnts, -1, 255, -1)
 
     mask &= paper
     if ARUCO_EXCLUDE is not None and ARUCO_EXCLUDE.shape == mask.shape:
         mask[ARUCO_EXCLUDE > 0] = 0          # Marker 不算物體
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((kpx(5), kpx(5)), np.uint8))
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((kpx(7), kpx(7)), np.uint8))
 
 
 def detect_objects(img, bg):
@@ -385,8 +404,8 @@ def measure_height(cnt, obj_mask, depth):
     def ell(r):
         return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
     inner = cv2.erode(fill, ell(HEIGHT_INNER_ERODE_PX))
-    if cv2.countNonZero(inner) < 20:                      # 工件太小 → 少縮一點
-        inner = cv2.erode(fill, ell(2))
+    if cv2.countNonZero(inner) < 20 * PX_SCALE ** 2:      # 工件太小 → 少縮一點
+        inner = cv2.erode(fill, ell(max(1, int(round(2 * PX_SCALE)))))
     r_in, r_out = HEIGHT_RING_PX
     ring = cv2.dilate(fill, ell(r_out)) & ~cv2.dilate(fill, ell(r_in)) & ~cv2.dilate(obj_mask, ell(r_in))
     if ARUCO_EXCLUDE is not None and ARUCO_EXCLUDE.shape == ring.shape:
@@ -396,9 +415,68 @@ def measure_height(cnt, obj_mask, depth):
     if len(d_in) < 15 or len(d_ring) < 30:
         return None
     h = float(np.median(d_ring) - np.median(d_in))
+    if SIDE_WALL_FIX and 1.0 < h <= HEIGHT_MAX_MM:
+        # 輪廓裡含側面時 (側面比頂面深)，內部的中位數會偏深 → 拿掉側面後再量一次頂面
+        top = top_face(cnt, obj_mask.shape, h, depth)
+        if top is not cnt:
+            tf = np.zeros(obj_mask.shape[:2], np.uint8)
+            cv2.drawContours(tf, [top], -1, 255, -1)
+            ti = cv2.erode(tf, ell(HEIGHT_INNER_ERODE_PX))
+            d_top = depth[(ti > 0) & (depth > 0)]
+            if len(d_top) >= 15:
+                h = float(np.median(d_ring) - np.median(d_top))
     if not -5.0 <= h <= HEIGHT_MAX_MM:
         return None
     return max(h, 0.0)
+
+
+def top_face(cnt, shape, h, depth=None):
+    """
+    拿掉透視看到的側面，只留工件「頂面」的輪廓。
+    工件不在相機正下方時，相機會斜斜看到朝向畫面中心那一側的側面，偵測到的輪廓 = 頂面 + 側面。
+    透視：高度 z 的點在畫面上 = 光軸中心 c + (底面位置 - c) × Zc / (Zc - z)，
+    所以頂面 T 往中心縮 k = 1 - t·h/Zc (t: 0 → 1) 一路掃到底面，掃過的範圍就是偵測到的輪廓 S。
+    反過來：x 屬於頂面 ⇔ 對所有 t，c + (x - c)·k 都還在 S 裡 → 把 S 縮放幾次取交集。
+    每個點依自己離光軸的距離算位移 (越靠畫面邊緣側面越寬)，不是整個物體用同一個位移。
+    有深度時先確認：要拿掉的那條真的比頂面深 (是側面)；不是就不動，避免側面沒被偵測到時削掉頂面。
+    回傳頂面輪廓；沒有修正時回傳原本的 cnt (同一個物件)
+    (想法來自組員 feature/detect-tuning 的 remove_side_wall，改成逐點透視縮放)
+    """
+    if not SIDE_WALL_FIX or h is None or h <= 0.5:
+        return cnt
+    f = h / CAM_HEIGHT_MM
+    cx, cy = CAM_CENTER_PX
+    pts = cnt.reshape(-1, 2).astype(np.float32)
+    dmax = float(np.max(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy))) * f   # 最寬的側面 (px)
+    if dmax < SIDE_WALL_MIN_PX * PX_SCALE:
+        return cnt
+    # 只處理工件附近的區域 (整張 1280x720 縮放很多次太慢)
+    x, y, w, hh = cv2.boundingRect(cnt)
+    pad = int(math.ceil(dmax)) + 2
+    x0, y0 = max(x - pad, 0), max(y - pad, 0)
+    x1, y1 = min(x + w + pad, shape[1]), min(y + hh + pad, shape[0])
+    sil = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.drawContours(sil, [cnt], -1, 255, -1, offset=(-x0, -y0))
+    top = sil.copy()
+    steps = int(math.ceil(dmax)) + 1                    # 每步位移 < 1 px
+    rcx, rcy = cx - x0, cy - y0                         # 光軸中心在 ROI 裡的座標
+    for i in range(1, steps + 1):
+        k = 1.0 - f * i / steps
+        M = np.float32([[k, 0, rcx * (1 - k)], [0, k, rcy * (1 - k)]])
+        top &= cv2.warpAffine(sil, M, (sil.shape[1], sil.shape[0]),
+                              flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP)
+    if depth is not None and depth.shape[:2] == shape[:2]:
+        d = depth[y0:y1, x0:x1]
+        strip = (sil > 0) & (top == 0)                  # 要拿掉的那條 (應該是側面)
+        core = cv2.erode(top, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kpx(7), kpx(7)))) > 0
+        ds, dt = d[strip & (d > 0)], d[core & (d > 0)]
+        if len(ds) > 30 and len(dt) > 30 and float(np.median(ds) - np.median(dt)) < SIDE_WALL_DEPTH_RATIO * h:
+            return cnt                                  # 那條跟頂面一樣高 → 不是側面 (側面沒被偵測到)，不動
+    cs, _ = cv2.findContours(top, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE, offset=(x0, y0))
+    if not cs:
+        return cnt
+    best = max(cs, key=cv2.contourArea)
+    return best if cv2.contourArea(best) > 0.3 * cv2.contourArea(cnt) else cnt
 
 
 def imwrite_u(path, img):
@@ -440,7 +518,7 @@ def lock_object(pipeline, bg, cnt):
             mm = cv2.moments(c)
             if mm["m00"]:
                 dd = float(np.hypot(*(np.array([mm["m10"] / mm["m00"], mm["m01"] / mm["m00"]]) - c0)))
-                if dd < 20 and (best is None or dd < best[0]):
+                if dd < 20 * PX_SCALE and (best is None or dd < best[0]):
                     best = (dd, c, msk)
         if not best:
             continue
@@ -494,6 +572,10 @@ def save_debug(frame, mask, cnts, sel, path_px, bg):
 def load_background():
     if os.path.exists(BG_PATH):
         bg = imread_u(BG_PATH)
+        if bg is not None and (bg.shape[1], bg.shape[0]) != CALIB_SIZE_NOW:
+            print(f"⚠️ 底圖是 {bg.shape[1]}x{bg.shape[0]}，相機現在是 {CALIB_SIZE_NOW[0]}x{CALIB_SIZE_NOW[1]}："
+                  "不能用，先用顏色模式。板子清空後按 b 重拍")
+            return None
         if bg is not None:
             print(f"📂 已載入底圖 {BG_PATH}")
             return bg
@@ -501,9 +583,50 @@ def load_background():
     return None
 
 
-def capture_background(pipeline, n=15):
+BG_SHIFT_WARN_PX = 3.0     # 底圖跟目前畫面的 Marker 位置差超過幾 px → 提醒重拍底圖 (相機 / 白板動過)
+
+
+def aruco_centers(img):
+    """單張影像裡的 Marker 中心 {id: (u, v)}"""
+    d = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        corners, ids, _ = cv2.aruco.ArucoDetector(d, cv2.aruco.DetectorParameters()).detectMarkers(gray)
+    else:
+        corners, ids, _ = cv2.aruco.detectMarkers(gray, d, parameters=cv2.aruco.DetectorParameters_create())
+    if ids is None:
+        return {}
+    return {int(i): tuple(c.reshape(4, 2).mean(axis=0)) for i, c in zip(ids.flatten(), corners)}
+
+
+def check_background(bg, frame):
+    """底圖跟目前畫面比 Marker 位置：位移太大 = 底圖過期 (相機 / 白板 / 拍照位置動過)，印出警告"""
+    if bg is None:
+        return
+    a, b = aruco_centers(bg), aruco_centers(frame)
+    common = set(a) & set(b)
+    if not common:
+        print("⚠️ 底圖或目前畫面找不到 Marker，沒辦法確認底圖有沒有過期")
+        return
+    shift = max(math.hypot(a[i][0] - b[i][0], a[i][1] - b[i][1]) for i in common)
+    if shift > BG_SHIFT_WARN_PX:
+        print(f"⚠️ 底圖可能過期：Marker 跟拍底圖時差了 {shift:.1f} px (相機或白板動過)。"
+              f"板子清空後按 b 重拍，不然邊緣會被誤判成物體")
+    else:
+        print(f"  底圖位置檢查 OK (Marker 位移 {shift:.1f} px)")
+
+
+def capture_background(pipeline, old_bg=None, n=15):
     acc = sum(grab(pipeline).astype(np.float32) for _ in range(n))
     bg = (acc / n).astype(np.uint8)
+    # 防呆：用顏色模式看板子上還有沒有東西 (底圖拍到物體 → 之後那個位置永遠被當成物體)
+    left, _ = detect_objects(bg, None)
+    if left:
+        areas = ", ".join(f"{cv2.contourArea(c):.0f}" for c in left[:5])
+        print(f"⚠️ 板子上好像還有 {len(left)} 個東西 (面積 px²：{areas})，底圖要拍「空的板子」")
+        if ask("  還是要用這張當底圖嗎？ y: 要   Enter: 不要 (先把東西拿開再按 b) > ", ("", "y")) != "y":
+            print("  沒有存，保留原本的底圖")
+            return old_bg
     os.makedirs(os.path.dirname(BG_PATH), exist_ok=True)
     imwrite_u(BG_PATH, bg)
     print(f"📷 已拍底圖 {BG_PATH}")
@@ -523,6 +646,9 @@ def make_path(cnt, shape):
     PATH_MODE = "edge"  ：沿邊緣走
     """
     global LAST_PATH_MODE
+    # 拿掉透視看到的側面，只留頂面。畫頂面、畫板面都用頂面輪廓：側面是直的 → 底面 XY = 頂面 XY，
+    # 而底面邊緣常被頂面擋住看不到；頂面 + 高度視差修正 (pixel_to_arm) 換到手臂座標最準
+    cnt = top_face(cnt, shape, obj_height(), LAST_DEPTH if DEPTH_ON else None)
     if PATH_MODE == "vertex":
         r = make_path_vertex(cnt, shape)
         if r is not None:
@@ -902,13 +1028,19 @@ def draw_path(arm, pts):
         rl_pts = build_rl_points(pts, draw_z() - PEN_PRESS_MM, draw_z() + Z_LIFT)
         print(f"🧴 開始塗膠 (RL 連續路徑)：{len(pts) - 1} 段，總長 {path_length(pts):.0f} mm，"
               f"速度 {RL_SPEED_GLUE}%")
-        try:
-            rl_path.RLPath(arm).run(rl_pts, (RX_HOME, RY_HOME, RZ_HOME))
-            return
-        except rl_path.RLPathError as e:
-            if arm._read(rl_path.BUF + 3, 1)[0] > 0:      # 已經開始動了 → 不要自動重來
-                raise
-            print(f"⚠️ RL 路徑無法執行：{e}\n   改用逐段 MovL (每段會停)")
+        while True:
+            try:
+                rl_path.RLPath(arm).run(rl_pts, (RX_HOME, RY_HOME, RZ_HOME))
+                return
+            except rl_path.RLPathError as e:
+                if arm._read(rl_path.BUF + 3, 1)[0] > 0:      # 已經開始動了 → 不要自動重來
+                    raise
+                print(f"⚠️ RL 路徑無法執行：{e}")
+            # T2 手動模式下 Modbus 啟動不了 RL，要在 DRAStudio 手動按 Start (每次塗膠前都要)
+            ans = ask("  Enter: 在 DRAStudio 按 Start 之後重試   s: 改用逐段 MovL (每段會停) > ", ("", "s"))
+            if ans == "s":
+                print("   改用逐段 MovL")
+                break
     z_up = draw_z() + Z_LIFT
     x0, y0 = pts[0]
     n = len(pts) - 1
@@ -1015,7 +1147,7 @@ def pick_point(pipeline, win, start, title, marks=(), frame=None, live_overlay=N
         put_text(out, f"{title}  ijkl: move  1/2/3: step ({step}px)  Enter: OK  Esc: cancel",
                  (10, 25), (0, 0, 255), 0.5)
         if live_overlay:
-            put_text(out, live_overlay(u, v), (10, 470), (0, 255, 0), 0.55)
+            put_text(out, live_overlay(u, v), (10, out.shape[0] - 10), (0, 255, 0), 0.55)
         cv2.imshow(win, out)
         key = poll_key(30)
         if key in JOG_KEYS:
@@ -1060,7 +1192,7 @@ def detect_four(pipeline, win):
         print(f"  {n}: 偵測到 {len(f)} 個 {sorted(f)}")
         for i, uv in f.items():
             # 同一個 Marker 被不同字典抓到 → 位置一樣，只留一個
-            if all(math.hypot(uv[0] - q[0], uv[1] - q[1]) > 20 for q in found.values()):
+            if all(math.hypot(uv[0] - q[0], uv[1] - q[1]) > 20 * PX_SCALE for q in found.values()):
                 found[f"{n}:{i}"] = uv
         if len(f) > best[0]:
             best = (len(f), n)
@@ -1174,7 +1306,10 @@ def save_calibration(taught, dict_name):
     set_calibration(px, am)
     TOOL_OFFSET_X = TOOL_OFFSET_Y = 0.0
     write_calib_json(pts_pixel=px.tolist(), pts_arm=am.tolist(), aruco_dict=dict_name,
-                     home=[X_HOME, Y_HOME, Z_HOME], tool_offset_x=0.0, tool_offset_y=0.0, corrections=[])
+                     home=[X_HOME, Y_HOME, Z_HOME], tool_offset_x=0.0, tool_offset_y=0.0, corrections=[],
+                     image_size=list(CALIB_SIZE_NOW))
+    global CALIB_SIZE
+    CALIB_SIZE = CALIB_SIZE_NOW
     print(f"  💾 已存到 {CALIB_PATH}，筆尖偏移歸 0")
     return True
 
@@ -1263,7 +1398,7 @@ def teach_with_pendant(arm, pipeline, win, targets, recalib=None):
                            (0, 0, 255) if j == k else (0, 255, 255), 3 if j == k else 1)
             ref = to_display(ref)
             for j, (_, _, _, uu, vv, _, _) in enumerate(items, 1):
-                sx, sy = flip_pt((uu, vv), shape)
+                sx, sy = disp_pt((uu, vv), shape)
                 put_text(ref, str(j), (sx + 24, sy + 6), (0, 0, 255) if j == k else (0, 255, 255), 0.8)
             en = {"左上": "TOP-LEFT", "右上": "TOP-RIGHT", "右下": "BOTTOM-RIGHT", "左下": "BOTTOM-LEFT"}
             put_text(ref, f"TEACH {k}/4 : {en.get(name, name)}", (10, 25), (0, 0, 255), 0.7)
@@ -1277,8 +1412,8 @@ def teach_with_pendant(arm, pipeline, win, targets, recalib=None):
                     pose = None
             if pose:
                 put_text(live, f"TCP X={pose[0]:.2f} Y={pose[1]:.2f} Z={pose[2]:.2f}", (10, 25), (0, 255, 0), 0.6)
-            put_text(live, "Enter: record  Space: skip  Esc: stop", (10, 470), (0, 255, 0))
-            cv2.imshow(win, cv2.resize(np.hstack([ref, live]), None, fx=0.75, fy=0.75))
+            put_text(live, "Enter: record  Space: skip  Esc: stop", (10, live.shape[0] - 10), (0, 255, 0))
+            cv2.imshow(win, np.hstack([ref, live]))      # 兩張都已經縮成 DISPLAY_SCALE
             key = poll_key(30)
 
             if key in (13, 10):
@@ -1338,6 +1473,37 @@ def recalibrate(arm, pipeline, win):
         targets.append((name, f"ID {mid}", u, v, x, y, None))
         print(f"  {name} [ID {mid}] 像素 ({u:.1f}, {v:.1f})")
     return teach_with_pendant(arm, pipeline, win, targets, recalib=dict_name)
+
+
+CALIB_SIZE_NOW = (CAM_W, CAM_H)   # 目前相機實際的解析度 (開相機後設定)
+
+
+def repixel_calibration(arm, pipeline, win):
+    """
+    換了相機解析度：Marker 的手臂座標 (PTS_ARM) 沒變，只要在 Home 重新抓 4 個 Marker 的像素位置。
+    前提是白板 / Marker / 相機都沒動過 (動過就要用 c 完整重新校正)
+    """
+    global CALIB_SIZE
+    arm.home()
+    time.sleep(1.0)
+    print("\n========== 換解析度：重新抓 Marker 像素位置 ==========")
+    r = detect_four(pipeline, win)
+    if r is None:
+        return False
+    dict_name, pts = r
+    px = np.float32([[u, v] for _, u, v in pts])     # 已排成 左上, 右上, 右下, 左下 (跟 PTS_ARM 同順序)
+    sc = side_scales(px, PTS_ARM)
+    print(f"  4 邊的 mm/px：{', '.join(f'{s:.3f}' for s in sc)}")
+    if (max(sc) - min(sc)) / np.mean(sc) > 0.15:
+        print("  ❌ 4 邊比例差太多：白板或 Marker 可能動過，請改用 c 完整重新校正")
+        return False
+    set_calibration(px, PTS_ARM)
+    write_calib_json(pts_pixel=px.tolist(), pts_arm=PTS_ARM.tolist(), aruco_dict=dict_name,
+                     image_size=list(CALIB_SIZE_NOW))
+    CALIB_SIZE = CALIB_SIZE_NOW
+    print(f"  💾 已更新 {CALIB_PATH} ({CALIB_SIZE_NOW[0]}x{CALIB_SIZE_NOW[1]}，平均 {MM_PER_PX:.3f} mm/px)。"
+          "筆尖偏移保留，下一步建議按 Enter 檢查筆尖偏移")
+    return True
 
 
 def locate_aruco(arm, pipeline, win):
@@ -1427,7 +1593,7 @@ def locate_aruco(arm, pipeline, win):
             put_text(live, f"ArUco {k}/4 {name}  dX={cx + pend[0] - x:+.1f} dY={cy + pend[1] - y:+.1f}  "
                            f"step {step}mm  {state}", (10, 25), (0, 255, 255), 0.55)
             put_text(live, "ijkl: move  1/2/3: step  Enter: record  Space: skip  d: dot  Esc: stop",
-                     (10, 470), (0, 255, 0), 0.45)
+                     (10, live.shape[0] - 10), (0, 255, 0), 0.45)
             cv2.imshow(win, live)
             key = poll_key(1)
 
@@ -1489,17 +1655,50 @@ DEPTH_SCALE = 0.001 # 深度單位 → 公尺
 LAST_DEPTH = None   # 最近一次 grab 的深度圖 (mm，float32，0 = 量不到)
 
 
+# 以 640x480 調好的 px 參數：開相機後依 PX_SCALE 放大 (線性的乘一次，面積的乘平方)
+_PX_LINEAR = ["HEIGHT_INNER_ERODE_PX", "HEIGHT_RING_PX", "DRAW_OFFSET_PX", "VERTEX_EPS_PX",
+              "VERTEX_MIN_SIDE_PX", "VERTEX_FIT_TOL_PX", "VERTEX_MAX_SHIFT_PX", "SMOOTH_PX",
+              "MASK_BLUR_PX", "ARUCO_MATCH_PX", "PAPER_MARGIN", "ARUCO_EXCLUDE_PAD_PX", "BG_SHIFT_WARN_PX"]
+_PX_AREA = ["MIN_AREA", "MAX_AREA"]
+_PX_INT = {"HEIGHT_INNER_ERODE_PX", "HEIGHT_RING_PX", "SMOOTH_PX", "PAPER_MARGIN", "ARUCO_EXCLUDE_PAD_PX"}
+_PX_BASE = {}
+
+
+def apply_px_scale(scale):
+    """把 px 參數換成目前解析度 (以 640x480 的原始值為準，重複呼叫不會一直放大)"""
+    global PX_SCALE
+    PX_SCALE = scale
+    g = globals()
+    for name in _PX_LINEAR + _PX_AREA:
+        _PX_BASE.setdefault(name, g[name])
+        base = _PX_BASE[name]
+        f = scale * scale if name in _PX_AREA else scale
+
+        def conv(v):
+            v = v * f
+            return int(round(v)) if name in _PX_INT else v
+        g[name] = tuple(conv(v) for v in base) if isinstance(base, tuple) else conv(base)
+    if SMOOTH_PX > 1 and SMOOTH_PX % 2 == 0:           # 平滑視窗要奇數
+        g["SMOOTH_PX"] = SMOOTH_PX + 1
+
+
+def kpx(n):
+    """函式裡寫死的 kernel 大小 (640x480 時是 n)：換成目前解析度的奇數大小"""
+    m = max(1, int(round(n * PX_SCALE)))
+    return m if m % 2 else m + 1
+
+
 def start_camera(pipeline):
     """
     開相機 (彩色；AUTO_HEIGHT 時加開深度)，印出 USB 版本 (USB 2.x 頻寬不夠，容易 Frame didn't arrive)
     深度開不起來 → 只用彩色，高度改用 OBJ_HEIGHT_MM
     """
-    global CAM_CFG, DEPTH_ON, ALIGN, DEPTH_SCALE
+    global CAM_CFG, DEPTH_ON, ALIGN, DEPTH_SCALE, CAM_CENTER_PX, CALIB_SIZE_NOW
     profile = None
     if AUTO_HEIGHT:
         cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        cfg.enable_stream(rs.stream.color, CAM_W, CAM_H, rs.format.bgr8, 30)
+        cfg.enable_stream(rs.stream.depth, DEPTH_W, DEPTH_H, rs.format.z16, 30)
         try:
             profile = pipeline.start(cfg)
             DEPTH_ON = True
@@ -1510,10 +1709,17 @@ def start_camera(pipeline):
             print(f"⚠️ 深度開不起來 ({e})，只用彩色，工件高度用 OBJ_HEIGHT_MM = {OBJ_HEIGHT_MM}")
     if profile is None:
         cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        cfg.enable_stream(rs.stream.color, CAM_W, CAM_H, rs.format.bgr8, 30)
         profile = pipeline.start(cfg)
         DEPTH_ON = False
     CAM_CFG = cfg
+    # 內參：光軸中心 (高度視差修正用) + 焦距 (px 參數換算用)
+    intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+    CAM_CENTER_PX = (intr.ppx, intr.ppy)
+    CALIB_SIZE_NOW = (intr.width, intr.height)
+    apply_px_scale(intr.fx / FX_REF)
+    print(f"📷 彩色 {intr.width}x{intr.height}" + (f"、深度 {DEPTH_W}x{DEPTH_H} (對齊到彩色)" if DEPTH_ON else "") +
+          f"，fx {intr.fx:.1f}、光軸 ({intr.ppx:.1f}, {intr.ppy:.1f})，px 參數 ×{PX_SCALE:.2f}")
     try:
         usb = profile.get_device().get_info(rs.camera_info.usb_type_descriptor)
         print(f"📷 RealSense 連線：USB {usb}" + ("  ⚠️ 不是 USB 3，容易掉幀，請換 USB 3 孔 / 線" if usb.startswith("2") else ""))
@@ -1572,30 +1778,42 @@ def flip_pt(pt, shape):
     return int(w - 1 - pt[0]), int(h - 1 - pt[1])
 
 
+def disp_pt(pt, shape):
+    """相機像素 → 縮小後顯示畫面上的座標 (寫字標記用)"""
+    sx, sy = flip_pt(pt, shape)
+    return int(sx * DISPLAY_SCALE), int(sy * DISPLAY_SCALE)
+
+
 def to_display(img):
-    return cv2.rotate(img, cv2.ROTATE_180) if DISPLAY_ROTATE_180 else img
+    """轉成顯示方向 + 縮成 DISPLAY_SCALE (字要在這之後寫，才不會跟著縮小)"""
+    out = cv2.rotate(img, cv2.ROTATE_180) if DISPLAY_ROTATE_180 else img
+    if DISPLAY_SCALE != 1.0:
+        out = cv2.resize(out, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE,
+                         interpolation=cv2.INTER_AREA if out.ndim == 3 else cv2.INTER_NEAREST)
+    return out
 
 
 def render(frame, cnts, sel, path_px, click, status):
     """先在相機畫面上畫線，轉成顯示方向後再寫字 (字才不會倒過來)"""
     out = frame.copy()
+    lt = max(1, int(round(1 / DISPLAY_SCALE)))          # 線條粗細：縮小顯示後還看得清楚
     for i, c in enumerate(cnts):
-        cv2.drawContours(out, [c], -1, (0, 255, 255) if i != sel else (0, 0, 255), 1)
+        cv2.drawContours(out, [c], -1, (0, 255, 255) if i != sel else (0, 0, 255), lt)
     if len(path_px) > 1:
-        cv2.polylines(out, [np.int32(path_px)], False, (255, 0, 0), 2)   # 塗膠路徑
+        cv2.polylines(out, [np.int32(path_px)], False, (255, 0, 0), 2 * lt)   # 塗膠路徑
         for p in (path_px if len(path_px) <= 30 else path_px[::5]):   # 點少 (頂點路徑) → 每點都標
-            cv2.circle(out, p, 2, (255, 255, 0), -1)          # 每 5 點標一下，看取點密度
-        cv2.circle(out, path_px[0], 6, (0, 255, 0), -1)       # 起點
+            cv2.circle(out, p, 2 * lt, (255, 255, 0), -1)     # 每 5 點標一下，看取點密度
+        cv2.circle(out, path_px[0], 6 * lt, (0, 255, 0), -1)  # 起點
     if click:
-        cv2.drawMarker(out, click, (255, 0, 255), cv2.MARKER_CROSS, 18, 2)
+        cv2.drawMarker(out, click, (255, 0, 255), cv2.MARKER_CROSS, 18 * lt, 2 * lt)
     if ARUCO_EXCLUDE is not None:
         ex, _ = cv2.findContours(ARUCO_EXCLUDE, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(out, ex, -1, (160, 160, 160), 1)   # 不偵測物體的 Marker 區域
+        cv2.drawContours(out, ex, -1, (160, 160, 160), lt)  # 不偵測物體的 Marker 區域
     out = to_display(out)
     if len(path_px) > 1:
-        sx, sy = flip_pt(path_px[0], frame.shape)
+        sx, sy = disp_pt(path_px[0], frame.shape)
         put_text(out, "START", (sx + 8, sy - 8), (0, 255, 0))
-    put_text(out, status, (10, 470), (0, 255, 0))
+    put_text(out, status, (10, out.shape[0] - 10), (0, 255, 0))
     put_text(out, "(keys in terminal) n:next s:lock a:aruco c:recalib b:bg t:dot p:snap q:quit", (10, 20))
     return out
 
@@ -1618,6 +1836,18 @@ def main():
         arm.grip(close=True)
         print("\n✊ 夾爪保持夾緊 (開始時不會打開)")
 
+        # --- 校正是在別的解析度做的 → 像素座標要重抓 ---
+        if CALIB_SIZE != CALIB_SIZE_NOW:
+            print(f"\n⚠️ 校正是在 {CALIB_SIZE[0]}x{CALIB_SIZE[1]} 做的，相機現在是 "
+                  f"{CALIB_SIZE_NOW[0]}x{CALIB_SIZE_NOW[1]}，Marker 像素位置要重抓")
+            while CALIB_SIZE != CALIB_SIZE_NOW:
+                a2 = ask("  Enter: 重抓 Marker 像素位置 (白板 / Marker 沒動過)   "
+                         "c: 完整重新校正 (動過，用示教器重教 4 點) > ", ("", "c"))
+                if a2 == "c":
+                    recalibrate(arm, pipeline, win)
+                else:
+                    repixel_calibration(arm, pipeline, win)
+
         # --- 先定位 4 個角的 ArUco ---
         ans = ask("\n[ArUco] Enter: 檢查筆尖偏移   c: 換了 Marker/紙板/相機 → 完整重新校正   "
                   "x: 跳過 > ", ("", "c", "x"))
@@ -1631,6 +1861,7 @@ def main():
 
         bg = load_background()
         build_aruco_exclude(pipeline)
+        check_background(bg, grab(pipeline))
         def preview_help():
             print("\n[預覽] (在終端機按，不用按 Enter) n: 換物體 / s: 鎖定路徑 / a: 檢查筆尖偏移 / "
                   "c: 完整重新校正 / b: 拍底圖 / t: 選位置點一個點 / p: 存偵測快照 / q: 離開")
@@ -1669,11 +1900,14 @@ def main():
             elif key == ord('a'):
                 locate_aruco(arm, pipeline, win)
                 build_aruco_exclude(pipeline)
+                check_background(bg, grab(pipeline))
             elif key == ord('c'):
                 recalibrate(arm, pipeline, win)
                 build_aruco_exclude(pipeline)
+                check_background(bg, grab(pipeline))
             elif key == ord('b'):
-                bg = capture_background(pipeline)
+                bg = capture_background(pipeline, bg)
+                flush_keys()
             elif key == ord('p'):
                 save_debug(frame, mask, cnts, sel, path_px, bg)
             elif key == ord('t'):
