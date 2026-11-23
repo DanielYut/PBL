@@ -14,7 +14,7 @@ Modbus 的 GO 指令一次只能送一個點，每段都會停；這裡改成：
 import os
 import time
 
-RL_ID = 1                   # DRAStudio Pro 裡這個專案的 RL ID (0x0220)
+RL_ID = 900                   # DRAStudio Pro 裡這個專案的 RL ID (0x0220)
 RL_VER = 3                  # 要跟 pbl_path.lua 的 VER 一樣
 LOADER_READY = 1001         # 0x1002 = 這個值 → 控制器上是 loader.lua，在等 Python 送程式
 LUA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rl", "pbl_path.lua")
