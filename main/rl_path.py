@@ -251,8 +251,11 @@ class RLPath:
         return echo, rl_pose
 
     # ---------- 執行 ----------
-    def run(self, points, rpy, timeout=600.0, keep_running=False):
-        """走完整條路徑才回傳；rpy = (RX, RY, RZ) 度"""
+    def run(self, points, rpy, timeout=600.0, keep_running=False, on_tick=None):
+        """
+        走完整條路徑才回傳；rpy = (RX, RY, RZ) 度
+        on_tick(i)：走的時候大約每 50 ms 呼叫一次 (i = 目前第幾點)，給呼叫端更新畫面用
+        """
         self.arm._write(BUF + 3, 0)                  # 執行進度歸零 (呼叫端用它判斷手臂動了沒)
         self.start()
         try:
@@ -278,9 +281,13 @@ class RLPath:
                 if i != last:
                     last = i
                     print(f"\r  RL 執行中：第 {i}/{len(points)} 點", end="", flush=True)
+                if on_tick:
+                    on_tick(i)
                 time.sleep(0.05)
             # 最後一段可能還在減速：等手臂真的停下來
             while self.arm._read(REG_MOTION, 1)[0] != 0 and time.time() - t0 < timeout:
+                if on_tick:
+                    on_tick(len(points))
                 time.sleep(0.02)
             print(f"\r  ✅ RL 路徑走完：{len(points)} 點，{time.time() - t0:.1f} s          ")
         except BaseException:

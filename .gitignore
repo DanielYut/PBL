@@ -9,3 +9,5 @@ rl/dist/
 /build/
 RLUploader.spec
 delta_smooth/
+data/geometry/
+data/quality/
